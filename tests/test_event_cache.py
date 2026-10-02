@@ -473,5 +473,205 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(r.reason, 'dedupe_window')
 
 
+class ApplyBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    # ---- 结果语义与一一对应 ----
+    def test_empty_operations_return_empty_without_clock(self):
+        self.assertEqual(self.cache.apply_batch([]), [])
+        self.assertEqual(self.cache.apply_batch(iter([])), [])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_results_align_one_to_one_in_order(self):
+        results = self.cache.apply_batch([
+            ("put", "a", 1, 10),
+            ("push", "d1", "e1", 10),
+            ("delete", "a"),
+            ("delete", "missing"),
+            ("cleanup",),
+        ])
+        self.assertEqual(len(results), 5)
+        self.assertIsInstance(results[0], Result)
+        self.assertEqual(results[0].accepted, True)
+        self.assertIsNone(results[0].reason)
+        self.assertTrue(results[1].accepted)
+        self.assertIsNone(results[1].reason)
+        self.assertTrue(results[2].deleted)
+        self.assertFalse(results[3].deleted)
+        self.assertEqual(results[4].values_removed, 0)
+        self.assertEqual(results[4].dedupe_removed, 0)
+        self.assertEqual(self.cache.pop(), 'e1')
+
+    def test_nonempty_batch_reads_clock_exactly_once(self):
+        results = self.cache.apply_batch([
+            ("put", "k%d" % i, i, 100) for i in range(4)
+        ] + [
+            ("push", "d%d" % i, "e%d" % i, 100) for i in range(4)
+        ] + [("cleanup",), ("delete", "k0")])
+        self.assertEqual(len(results), 10)
+        self.assertEqual(self.clock_calls[0], 1)
+
+    def test_put_with_zero_ttl_expires_at_same_moment(self):
+        results = self.cache.apply_batch([
+            ("put", "a", "v", 0),
+            ("cleanup",),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertEqual(results[1].values_removed, 1)  # 到期点 == 当前时刻即失效
+
+    # ---- 同批顺序可见性 ----
+    def test_later_operations_observe_prior_state(self):
+        results = self.cache.apply_batch([
+            ("put", "k", "v", 100),
+            ("delete", "k"),       # 看到前序 put -> True
+            ("delete", "k"),       # 已被删除 -> False
+        ])
+        self.assertEqual([r.deleted for r in results[1:]], [True, False])
+
+    def test_cleanup_in_batch_allows_later_push_with_same_dedupe(self):
+        self.cache.push('d', 'old', 10)
+        self.advance(10)  # 去重恰到期
+        results = self.cache.apply_batch([
+            ("cleanup",),
+            ("push", "d", "new", 10),
+        ])
+        self.assertEqual(results[0].dedupe_removed, 1)
+        self.assertTrue(results[1].accepted)
+        self.assertEqual([self.cache.pop(), self.cache.pop()], ['old', 'new'])
+
+    def test_queued_events_keep_fifo_order_and_cleanup_keeps_slots(self):
+        cache = self.make(1)
+        cache.push('pre', 'pre-e', 100)
+        self.advance(200)
+        results = cache.apply_batch([
+            ("cleanup",),                       # 去重记录到期被清
+            ("push", "pre", "again", 10),      # 槽位未释放 -> queue_full
+        ])
+        self.assertEqual(results[0].dedupe_removed, 1)
+        self.assertFalse(results[1].accepted)
+        self.assertEqual(results[1].reason, 'queue_full')
+        self.assertEqual(cache.pop(), 'pre-e')
+
+    def test_push_rejections_keep_priority_and_do_not_touch_dedupe(self):
+        cache = self.make(1)
+        cache.push('d0', 'e0', 100)
+        results = cache.apply_batch([
+            ("push", "d1", "e1", 100),   # queue_full，不登记
+            ("push", "d0", "dup", 100),  # dedupe_window 优先
+        ])
+        self.assertEqual(results[0].reason, 'queue_full')
+        self.assertEqual(results[1].reason, 'dedupe_window')
+        self.assertNotIn('d1', cache.seen)
+        self.assertEqual(cache.seen['d0'], 200)  # 旧占用未延长（时钟为 100）
+
+    def test_accepts_generators_and_tuple_only_entries(self):
+        ops = (x for x in [("put", "g", 1, 10), ("push", "gd", "ge", 10)])
+        results = self.cache.apply_batch(ops)
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertEqual(self.cache.pop(), 'ge')
+
+    # ---- 校验原子性 ----
+    def assert_state_untouched(self):
+        self.assertEqual(self.cache.queue_status().size, 0)
+        self.assertEqual(self.cache.seen, {})
+        self.assertEqual(self.cache.values, {})
+
+    def test_invalid_structure_raises_value_error_atomically(self):
+        for bad in (
+            None, 42, 3.14, True,
+            ("put", "k", "v", 10),          # 单个操作元组不可当作序列
+            [("put", "k", "v")],            # put 长度不符
+            [("delete",)],                  # delete 长度不符
+            [("push", "d", "e")],           # push 长度不符
+            [("push", "d", "e", 10, 1)],    # push 长度不符
+            [("cleanup", 1)],               # cleanup 长度不符
+            [("unknown",)],                 # 未知标签
+            [["put", "k", "v", 10]],        # 条目必须是元组
+            [()],                           # 空元组
+            [("put", "k", "v", 10), 5],     # 中途出现非元组
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.apply_batch(bad)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assert_state_untouched()
+
+    def test_invalid_durations_raise_value_error_atomically(self):
+        for bad in (-1, float('nan'), float('inf'), -float('inf'), True, '10', None, 1.0j):
+            with self.assertRaises(ValueError):
+                self.cache.apply_batch([
+                    ("put", "k1", 1, 10),
+                    ("put", "k2", 2, bad),
+                ])
+            with self.assertRaises(ValueError):
+                self.cache.apply_batch([
+                    ("push", "d1", "e1", 10),
+                    ("push", "d2", "e2", bad),
+                ])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assert_state_untouched()
+
+    def test_generator_failing_mid_validation_changes_nothing(self):
+        def gen():
+            yield ("put", "k", "v", 10)
+            yield ("cleanup", "extra")
+
+        with self.assertRaises(ValueError):
+            self.cache.apply_batch(gen())
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assert_state_untouched()
+
+    def test_unhashable_key_raises_type_error_atomically(self):
+        for bad in (
+            [("put", ["k"], "v", 10)],
+            [("delete", {"k": 1})],
+            [("push", {"d"}, "e", 10)],
+            [("put", "ok", 1, 10), ("delete", [])],
+        ):
+            with self.assertRaises(TypeError):
+                self.cache.apply_batch(bad)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assert_state_untouched()
+
+    def test_invalid_batch_preserves_existing_state(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push('d0', 'e0', 100)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.apply_batch([("delete", "k"), ("push", "d", "e", "bad")])
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertIn('k', self.cache.values)
+        self.assertEqual(set(self.cache.seen), {'d0'})
+
+    def test_clock_exception_propagates_without_state_change(self):
+        class Boom(Exception):
+            pass
+
+        self.cache.put('keep', 'v', 100)
+        self.cache.clock = lambda: (_ for _ in ()).throw(Boom())
+        with self.assertRaises(Boom):
+            self.cache.apply_batch([
+                ("delete", "keep"),
+                ("push", "d", "e", 10),
+            ])
+        self.assertIn('keep', self.cache.values)
+        self.assertEqual(self.cache.seen, {})
+        self.assertEqual(self.cache.queue_status().size, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

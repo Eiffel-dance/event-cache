@@ -49,6 +49,51 @@ def _parse_batch(batch):
     return entries
 
 
+def _parse_operations(operations):
+    """在读取时钟或改变任何状态前完整解析并校验 apply_batch 的操作序列。
+
+    序列不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window 非法时
+    统一抛出 ValueError；键（含去重键）不可哈希时原样抛出 TypeError。
+    返回物化后的操作元组列表，供后续在同一时钟时刻按序执行。
+    """
+    try:
+        iterator = iter(operations)
+    except TypeError:
+        raise ValueError('operations must be an iterable of operation tuples')
+    entries = []
+    for item in iterator:
+        if not isinstance(item, tuple) or not item:
+            raise ValueError('each operation must be a non-empty tagged tuple')
+        tag = item[0]
+        if tag == 'put':
+            if len(item) != 4:
+                raise ValueError('put operation must be ("put", key, value, ttl)')
+            key, value, ttl = item[1], item[2], item[3]
+            _check_duration(ttl, 'ttl')
+            hash(key)  # 不可哈希的键无法用于缓存索引，抛出 TypeError
+            entries.append(('put', key, value, ttl))
+        elif tag == 'delete':
+            if len(item) != 2:
+                raise ValueError('delete operation must be ("delete", key)')
+            key = item[1]
+            hash(key)
+            entries.append(('delete', key))
+        elif tag == 'push':
+            if len(item) != 4:
+                raise ValueError('push operation must be ("push", dedupe, event, window)')
+            dedupe, event, window = item[1], item[2], item[3]
+            _check_duration(window, 'window')
+            hash(dedupe)
+            entries.append(('push', dedupe, event, window))
+        elif tag == 'cleanup':
+            if len(item) != 1:
+                raise ValueError('cleanup operation must be ("cleanup",)')
+            entries.append(('cleanup',))
+        else:
+            raise ValueError('unknown operation tag: %r' % (tag,))
+    return entries
+
+
 class EventCache:
     def __init__(self, clock, max_queue=None):
         _check_max_queue(max_queue)
@@ -80,8 +125,7 @@ class EventCache:
         # 无论值是否已过期都移除，返回调用前是否存在该键
         return self.values.pop(key, None) is not None
 
-    def cleanup(self):
-        now = self.clock()
+    def _cleanup_at(self, now):
         values_removed = 0
         for key in [k for k, (_, expiry) in self.values.items() if expiry <= now]:
             del self.values[key]
@@ -91,6 +135,11 @@ class EventCache:
             del self.seen[key]
             dedupe_removed += 1
         # 已排入队列的事件不受影响
+        return values_removed, dedupe_removed
+
+    def cleanup(self):
+        now = self.clock()
+        values_removed, dedupe_removed = self._cleanup_at(now)
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
     def _try_push_at(self, dedupe, event, window, now):
@@ -130,6 +179,41 @@ class EventCache:
                 # 前项已立即更新 seen 与队列占用，后项据此继续判定
                 reason = self._try_push_at(dedupe, event, window, now)
                 results.append(Result(accepted=reason is None, reason=reason))
+        return results
+
+    def apply_batch(self, operations):
+        # 先完整遍历并校验所有操作：在此之前不读取时钟、不改变任何状态
+        entries = _parse_operations(operations)
+        results = []
+        if not entries:
+            # 空批次不读取时钟
+            return results
+        # 校验完成后只读取一次时钟；时钟抛出的异常原样转出，状态保持不变
+        now = self.clock()
+        for entry in entries:
+            tag = entry[0]
+            if tag == 'put':
+                _, key, value, ttl = entry
+                # 以批次时刻加 ttl 记录到期点，并替换同 key 旧值
+                self.values[key] = (value, now + ttl)
+                results.append(Result(accepted=True, reason=None))
+            elif tag == 'delete':
+                _, key = entry
+                # 无论值是否已过期都移除，返回调用前是否存在该键
+                deleted = self.values.pop(key, None) is not None
+                results.append(Result(deleted=deleted))
+            elif tag == 'push':
+                _, dedupe, event, window = entry
+                # 与 push_with_reason 相同的判定边界、优先级与 reason
+                reason = self._try_push_at(dedupe, event, window, now)
+                results.append(Result(accepted=reason is None, reason=reason))
+            else:  # cleanup
+                # 不触碰队列事件，也不释放队列槽位；后续操作立即看到清理后的状态
+                values_removed, dedupe_removed = self._cleanup_at(now)
+                results.append(Result(
+                    values_removed=values_removed,
+                    dedupe_removed=dedupe_removed,
+                ))
         return results
 
     def pop(self):
