@@ -1,5 +1,8 @@
 import math
 from collections import deque
+from collections.abc import Mapping
+
+_SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
 
 
 class Result(dict):
@@ -10,6 +13,28 @@ class Result(dict):
             return self[name]
         except KeyError:
             raise AttributeError(name)
+
+
+class Snapshot(Result):
+    """快照结果：仍是 Result，但 values 字段与 dict.values 方法同名，
+    必须以数据描述符优先返回条目，保证 snapshot.values 与 snapshot['values']
+    都取到 values 映射；其余三个字段一并显式声明属性访问。"""
+
+    @property
+    def values(self):
+        return self['values']
+
+    @property
+    def events(self):
+        return self['events']
+
+    @property
+    def seen(self):
+        return self['seen']
+
+    @property
+    def max_queue(self):
+        return self['max_queue']
 
 
 def _check_duration(value, name):
@@ -97,6 +122,47 @@ def _parse_apply_batch(batch):
         else:
             raise ValueError('unknown operation tag: %r' % (tag,))
     return operations
+
+
+def _parse_snapshot(snapshot):
+    """在读取时钟或改变任何状态前完整解析并校验快照。
+
+    快照必须是恰好含 values、events、seen、max_queue 四个字段的映射：
+    values 为 key -> (value, expires_at) 的映射，seen 为去重键 -> 绝对到期
+    时间的映射，events 为事件列表（按 FIFO 顺序），max_queue 为 None 或
+    非负整数。字段缺失或多余、非映射/列表容器、二元组结构不符或 max_queue
+    非法时统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
+    校验期间一次性物化为全新的 dict/list/deque，供调用方随后整体替换状态。
+    """
+    if not isinstance(snapshot, Mapping):
+        raise ValueError('snapshot must be a mapping with values, events, seen, max_queue')
+    if frozenset(snapshot.keys()) != _SNAPSHOT_FIELDS:
+        raise ValueError('snapshot must contain exactly values, events, seen, max_queue')
+
+    raw_values = snapshot['values']
+    raw_seen = snapshot['seen']
+    raw_events = snapshot['events']
+    if not isinstance(raw_values, Mapping):
+        raise ValueError('snapshot values must be a mapping')
+    if not isinstance(raw_seen, Mapping):
+        raise ValueError('snapshot seen must be a mapping')
+    if not isinstance(raw_events, list):
+        raise ValueError('snapshot events must be a list')
+    _check_max_queue(snapshot['max_queue'])
+
+    values = {}
+    for key, item in raw_values.items():
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError('each values entry must be a (value, expires_at) pair')
+        hash(key)  # 不可哈希时原样抛出 TypeError
+        values[key] = item
+    seen = {}
+    for key, expiry in raw_seen.items():
+        hash(key)  # 不可哈希时原样抛出 TypeError
+        seen[key] = expiry
+    # list() 物化事件副本；值与事件对象按既有语义保留引用
+    events = deque(raw_events)
+    return values, events, seen, snapshot['max_queue']
 
 
 class EventCache:
@@ -243,3 +309,34 @@ class EventCache:
     def queue_status(self):
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
+
+    def snapshot(self):
+        """捕获某一时刻的可检查、可恢复状态快照。
+
+        纯查询：不读取时钟、不触发任何惰性或显式清理，快照中的过期 values/seen
+        记录与未出队事件一律原样保留。返回只含 values、events、seen、max_queue
+        四个字段的 Result，外层字典与事件列表均为与缓存分离的副本，随后任一方
+        增删都不会影响另一方；value 与事件对象按既有接口语义保留引用。
+        """
+        return Snapshot(
+            values=dict(self.values),
+            events=list(self.events),
+            seen=dict(self.seen),
+            max_queue=self.max_queue,
+        )
+
+    def restore(self, snapshot):
+        """从快照一次性恢复 values、events、seen、max_queue。
+
+        先完整解析并校验快照：在此之前不读取时钟、不改变任何状态，校验失败时
+        原状态、队列顺序和容量完全保持。成功后以副本整体替换四份状态并返回
+        None，恢复出的容器与传入快照相互独立。恢复后一律由本实例当前时间源
+        按既有的 expiry <= now 边界判定过期，不隐式清理、不释放队列槽位、
+        不延长去重窗口。
+        """
+        values, events, seen, max_queue = _parse_snapshot(snapshot)
+        self.values = values
+        self.events = events
+        self.seen = seen
+        self.max_queue = max_queue
+        return None

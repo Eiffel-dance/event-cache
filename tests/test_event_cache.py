@@ -671,5 +671,278 @@ class PopBatchTest(unittest.TestCase):
         self.assertEqual(self.cache.pop_batch(2), ['e2'])
 
 
+class SnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, max_queue=None, now=None):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    def seed(self):
+        cache = self.make(max_queue=3)
+        cache.put('k1', 'v1', 50)   # 到期点 150
+        cache.put('k2', 'v2', 200)  # 到期点 300
+        cache.push('d1', 'e1', 10)  # seen d1 -> 110
+        cache.push('d2', 'e2', 100)  # seen d2 -> 200
+        return cache
+
+    # ---- 快照结构与访问方式 ----
+    def test_snapshot_has_exactly_four_fields_and_result_access(self):
+        snap = self.seed().snapshot()
+        self.assertIsInstance(snap, Result)
+        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        self.assertEqual(snap.max_queue, 3)
+        self.assertEqual(snap['max_queue'], 3)
+        self.assertEqual(snap.events, ['e1', 'e2'])
+        self.assertEqual(snap['events'], ['e1', 'e2'])
+        self.assertEqual(snap.seen, {'d1': 110, 'd2': 200})
+        self.assertEqual(snap['seen'], {'d1': 110, 'd2': 200})
+        # values 与 dict.values 方法同名，属性访问仍须取到条目
+        self.assertEqual(snap.values, {'k1': ('v1', 150), 'k2': ('v2', 300)})
+        self.assertEqual(snap['values'], snap.values)
+
+    def test_snapshot_events_is_plain_list(self):
+        snap = self.seed().snapshot()
+        self.assertIsInstance(snap.events, list)
+
+    # ---- 纯查询：不读时钟、不过滤过期项 ----
+    def test_snapshot_does_not_read_clock_or_cleanup(self):
+        cache = self.seed()
+        self.now[0] = 130  # k1 与 d1 已到期
+        calls_before = self.clock_calls[0]
+        snap = cache.snapshot()
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertIn('k1', snap.values)  # 过期 value 原样保留
+        self.assertIn('d1', snap.seen)    # 过期去重记录原样保留
+        self.assertIn('k1', cache.values)
+        self.assertIn('d1', cache.seen)
+        self.assertEqual(snap.events, ['e1', 'e2'])
+
+    # ---- 容器分离 ----
+    def test_snapshot_is_detached_from_cache_both_ways(self):
+        cache = self.seed()
+        snap = cache.snapshot()
+        snap['values']['k1'] = ('changed', 0)
+        snap['events'].append('hack')
+        snap['seen']['d1'] = 1
+        self.assertEqual(cache.values['k1'], ('v1', 150))
+        self.assertEqual(list(cache.events), ['e1', 'e2'])
+        self.assertEqual(cache.seen['d1'], 110)
+
+        cache.pop()
+        cache.put('k3', 'v3', 10)
+        self.assertEqual(snap.events, ['e1', 'e2', 'hack'])
+        self.assertNotIn('k3', snap.values)
+
+    def test_value_and_event_objects_keep_references(self):
+        event = {'id': 1}
+        value = object()
+        cache = self.make()
+        cache.put('k', value, 100)
+        cache.push('d', event, 100)
+        snap = cache.snapshot()
+        self.assertIs(snap.values['k'][0], value)
+        self.assertIs(snap.events[0], event)
+
+    # ---- 恢复到另一时间源实例 ----
+    def test_restore_into_other_clock_preserves_semantics(self):
+        source = self.seed()
+        self.now[0] = 130  # k1(150) 未到期、d1(110) 已到期
+        snap = source.snapshot()
+
+        target_now = [130]
+        target = EventCache(lambda: target_now[0], max_queue=99)
+        target.put('junk', 'j', 1000)
+        target.push('zd', 'ze', 1000)
+        self.assertIsNone(target.restore(snap))
+        # 容量与状态全部来自快照，而非目标构造参数
+        self.assertEqual(target.max_queue, 3)
+        self.assertEqual(target.values, {'k1': ('v1', 150), 'k2': ('v2', 300)})
+        self.assertEqual(target.seen, {'d1': 110, 'd2': 200})
+        self.assertEqual([target.pop(), target.pop()], ['e1', 'e2'])
+
+    def test_expiry_judged_by_target_clock_at_boundary(self):
+        snap = self.seed().snapshot()
+        target_now = [149]
+        target = EventCache(lambda: target_now[0])
+        target.restore(snap)
+        self.assertEqual(target.get('k1'), 'v1')
+        target_now[0] = 150  # 到期点 <= 当前时刻
+        self.assertIsNone(target.get('k1'))
+        self.assertNotIn('k1', target.values)
+
+    def test_restored_capacity_and_reasons_match_saved_state(self):
+        snap = self.seed().snapshot()
+        target_now = [130]
+        target = EventCache(lambda: target_now[0])
+        target.restore(snap)
+        # d1 到期点 110 <= 130：可重新入队，占最后一个槽位
+        self.assertTrue(target.push('d1', 'e3', 10))
+        self.assertEqual(target.push_with_reason('dx', 'full', 10).reason, 'queue_full')
+        # d2 到期点 200 > 130：仍在去重窗口内，优先报 dedupe_window
+        self.assertEqual(target.push_with_reason('d2', 'dup', 10).reason, 'dedupe_window')
+        target_now[0] = 200  # 边界到期
+        self.assertEqual(target.pop_batch(), ['e1', 'e2', 'e3'])  # 释放槽位
+        self.assertTrue(target.push('d2', 'e4', 100))
+        self.assertEqual(target.pop_batch(), ['e4'])
+
+    def test_expired_dedupe_does_not_change_queued_order(self):
+        snap = self.seed().snapshot()
+        target = EventCache(lambda: 9999)  # 所有 seen 早已到期
+        target.restore(snap)
+        self.assertEqual(target.seen, {'d1': 110, 'd2': 200})  # 记录保留
+        self.assertEqual(target.pop_batch(), ['e1', 'e2'])      # 顺序不动
+
+    def test_restore_copies_containers_detached_from_snapshot(self):
+        snap = self.seed().snapshot()
+        target = EventCache(lambda: 0)
+        target.restore(snap)
+        snap['events'].append('nope')
+        snap['values']['new'] = ('n', 1)
+        self.assertEqual(list(target.events), ['e1', 'e2'])
+        self.assertNotIn('new', target.values)
+
+    def test_snapshot_restore_round_trip_is_equivalent(self):
+        cache = self.seed()
+        snap1 = cache.snapshot()
+        rebuilt = EventCache(lambda: 0, max_queue=99)
+        rebuilt.restore(snap1)
+        snap2 = rebuilt.snapshot()
+        self.assertEqual(snap1, snap2)
+
+    # ---- 恢复校验：失败原子、不读时钟 ----
+    def assert_restore_rejected(self, cache, bad, exc_type):
+        before = (dict(cache.values), list(cache.events), dict(cache.seen), cache.max_queue)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(exc_type):
+            cache.restore(bad)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        after = (dict(cache.values), list(cache.events), dict(cache.seen), cache.max_queue)
+        self.assertEqual(before, after)
+
+    def test_restore_requires_exactly_four_fields(self):
+        cache = self.seed()
+        good = {'values': {}, 'events': [], 'seen': {}, 'max_queue': None}
+        for bad in (
+            None, [], object(),
+            {},
+            {'values': {}, 'events': [], 'seen': {}},
+            dict(good, extra=1),
+            {'values': {}, 'seen': {}, 'max_queue': None},  # 缺 events
+        ):
+            self.assert_restore_rejected(cache, bad, ValueError)
+
+    def test_restore_rejects_wrong_containers_and_pairs(self):
+        cache = self.seed()
+        for bad in (
+            {'values': [], 'events': [], 'seen': {}, 'max_queue': None},
+            {'values': {}, 'events': (), 'seen': {}, 'max_queue': None},
+            {'values': {}, 'events': {}, 'seen': {}, 'max_queue': None},
+            {'values': {}, 'events': [], 'seen': [], 'max_queue': None},
+            {'values': {'k': 'v'}, 'events': [], 'seen': {}, 'max_queue': None},
+            {'values': {'k': ('v',)}, 'events': [], 'seen': {}, 'max_queue': None},
+            {'values': {'k': ('v', 1, 2)}, 'events': [], 'seen': {}, 'max_queue': None},
+            {'values': {'k': ['v', 1]}, 'events': [], 'seen': {}, 'max_queue': None},
+        ):
+            self.assert_restore_rejected(cache, bad, ValueError)
+
+    def test_restore_rejects_bad_max_queue(self):
+        cache = self.seed()
+        for mq in (-1, -10, 1.5, 2.0, True, False, '3', []):
+            self.assert_restore_rejected(
+                cache,
+                {'values': {}, 'events': [], 'seen': {}, 'max_queue': mq},
+                ValueError,
+            )
+
+    def test_restore_accepts_none_and_non_negative_int_max_queue(self):
+        for mq in (None, 0, 1, 10 ** 6):
+            cache = self.make()
+            self.assertIsNone(
+                cache.restore({'values': {}, 'events': [], 'seen': {}, 'max_queue': mq})
+            )
+            self.assertEqual(cache.max_queue, mq)
+
+    def test_restore_accepts_mapping_subclass(self):
+        from collections.abc import Mapping
+
+        class M(Mapping):
+            def __init__(self, data):
+                self._data = data
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+        cache = self.make()
+        good = {'values': {'k': ('v', 10)}, 'events': ['e'], 'seen': {}, 'max_queue': 2}
+        self.assertIsNone(cache.restore(M(good)))
+        self.assertEqual(cache.max_queue, 2)
+        self.assertEqual(cache.pop_batch(), ['e'])
+
+    def test_restore_unhashable_key_raises_type_error_atomically(self):
+        from collections.abc import Mapping
+
+        class OneItem(Mapping):
+            # 绕过字典字面量构造期即抛出的限制，在解析时才暴露不可哈希键
+            def __init__(self, key, value):
+                self._key = key
+                self._value = value
+
+            def __getitem__(self, key):
+                if key == self._key:
+                    return self._value
+                raise KeyError(key)
+
+            def __iter__(self):
+                yield self._key
+
+            def __len__(self):
+                return 1
+
+        cache = self.seed()
+        self.assert_restore_rejected(
+            cache,
+            {'values': OneItem(['k'], ('v', 1)), 'events': [], 'seen': {}, 'max_queue': None},
+            TypeError,
+        )
+        self.assert_restore_rejected(
+            cache,
+            {'values': {}, 'events': [], 'seen': OneItem(['d'], 1), 'max_queue': None},
+            TypeError,
+        )
+
+    def test_failed_restore_keeps_cache_fully_functional(self):
+        cache = self.seed()
+        with self.assertRaises(ValueError):
+            cache.restore({'values': {}, 'events': [], 'seen': {}, 'max_queue': -1})
+        self.now[0] = 100
+        self.assertEqual(cache.get('k1'), 'v1')
+        self.assertEqual(cache.pop(), 'e1')
+        self.assertTrue(cache.push('d3', 'e3', 10))
+
+    def test_none_values_and_events_survive_snapshot_restore(self):
+        cache = self.make()
+        cache.put('a', None, 100)
+        cache.push(None, None, 100)
+        target = EventCache(lambda: 100)
+        target.restore(cache.snapshot())
+        self.assertIsNone(target.get('a'))
+        self.assertIn('a', target.values)
+        self.assertEqual(target.pop_batch(), [None])
+
+
 if __name__ == '__main__':
     unittest.main()
