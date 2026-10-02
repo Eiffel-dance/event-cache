@@ -262,5 +262,198 @@ class CapacityTest(unittest.TestCase):
         self.assertEqual(cache.pop(), 'e')  # 队列顺序未变
 
 
+class BatchTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.calls = []
+        self.cache = EventCache(self._clock)
+
+    def _clock(self):
+        self.calls.append(self.now[0])
+        return self.now[0]
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 基础顺序与结果语义 ----
+    def test_returns_results_in_input_order(self):
+        results = self.cache.push_batch([
+            ('d1', 'e1', 10),
+            ('d2', 'e2', 10),
+            ('d1', 'e1-dup', 10),
+        ])
+        self.assertEqual([r.accepted for r in results], [True, True, False])
+        self.assertEqual([r.reason for r in results], [None, None, 'dedupe_window'])
+        self.assertEqual([self.cache.pop() for _ in range(2)], ['e1', 'e2'])
+        self.assertIsNone(self.cache.pop())
+
+    def test_reason_semantics_match_push_with_reason(self):
+        results = self.cache.push_batch([('d', 'e', 10)])
+        single = self.cache.push_with_reason('d', 'e2', 10)
+        self.assertEqual(results[0].accepted, True)
+        self.assertEqual(results[0].reason, None)
+        self.assertEqual(results[0]['accepted'], True)
+        self.assertEqual(single.accepted, False)
+        self.assertEqual(single.reason, 'dedupe_window')
+
+    def test_accepts_generators_and_other_iterables(self):
+        results = self.cache.push_batch(('d%d' % i, 'e%d' % i, 10) for i in range(3))
+        self.assertEqual([r.accepted for r in results], [True, True, True])
+        self.assertEqual([self.cache.pop() for _ in range(3)], ['e0', 'e1', 'e2'])
+
+    # ---- 单一时钟时刻 ----
+    def test_clock_read_once_for_whole_batch(self):
+        results = self.cache.push_batch([
+            ('d1', 'e1', 10),
+            ('d2', 'e2', 10),
+            ('d3', 'e3', 10),
+        ])
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(all(r.accepted for r in results))
+
+    def test_batch_uses_one_moment_even_across_rejections(self):
+        self.cache.push('d0', 'e0', 10)
+        self.calls.clear()
+        results = self.cache.push_batch([
+            ('d1', 'e1', 10),
+            ('d1', 'e1-dup', 10),  # 同批次前项刚登记，窗口内拒绝
+            ('d2', 'e2', 10),
+        ])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual([r.reason for r in results], [None, 'dedupe_window', None])
+
+    def test_window_zero_boundary_within_batch(self):
+        # window=0 => 到期点 == 批次时刻，<= 边界下同批次可重复入队
+        results = self.cache.push_batch([
+            ('d', 'e1', 0),
+            ('d', 'e2', 0),
+            ('d', 'e3', 0),
+        ])
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertEqual([self.cache.pop() for _ in range(3)], ['e1', 'e2', 'e3'])
+
+    # ---- 容量与拒绝副作用 ----
+    def test_queue_full_after_capacity_consumed_within_batch(self):
+        cache = EventCache(lambda: self.now[0], max_queue=2)
+        results = cache.push_batch([
+            ('d1', 'e1', 10),
+            ('d2', 'e2', 10),
+            ('d3', 'e3', 10),
+        ])
+        self.assertEqual([r.reason for r in results], [None, None, 'queue_full'])
+        self.assertEqual([cache.pop(), cache.pop()], ['e1', 'e2'])
+        self.assertNotIn('d3', cache.seen)  # 被拒项不登记去重
+
+    def test_dedupe_window_priority_over_queue_full_in_batch(self):
+        cache = EventCache(lambda: self.now[0], max_queue=1)
+        cache.push('d1', 'e0', 100)
+        results = cache.push_batch([
+            ('d2', 'e2', 10),   # 队列已满
+            ('d1', 'e1-dup', 100),  # 去重窗口优先
+        ])
+        self.assertEqual([r.reason for r in results], ['queue_full', 'dedupe_window'])
+        self.assertNotIn('d2', cache.seen)
+        self.assertEqual(cache.seen['d1'], self.now[0] + 100)  # 旧占用未延长
+
+    def test_rejected_item_keeps_fifo_insertion_order(self):
+        self.cache.push_batch([
+            ('d1', 'e1', 10),
+            ('d1', 'rejected', 10),
+            ('d2', 'e2', 10),
+        ])
+        self.assertEqual([self.cache.pop(), self.cache.pop()], ['e1', 'e2'])
+
+    # ---- 空批次 ----
+    def test_empty_batch_returns_empty_without_clock(self):
+        self.assertEqual(self.cache.push_batch([]), [])
+        self.assertEqual(self.calls, [])
+
+    def test_empty_generator_does_not_read_clock(self):
+        self.assertEqual(self.cache.push_batch(iter(())), [])
+        self.assertEqual(self.calls, [])
+
+    # ---- 校验与原子性 ----
+    def test_non_iterable_batch_raises_value_error(self):
+        for bad in (None, 42, 3.5, object()):
+            with self.assertRaises(ValueError):
+                self.cache.push_batch(bad)
+
+    def test_malformed_items_raise_value_error(self):
+        for bad_items in (
+            [('d1', 'e1')],                    # 缺 window
+            [('d1', 'e1', 10, 'extra')],       # 多出成员
+            [('d1',)],                         # 只给 dedupe
+            [42],                              # 条目不可解析
+            [None],
+            ['d1'],                            # 字符串展开后不足三元
+            [('d1', 'e1', 10), ('d2', 'e2')],  # 后项缺成员
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.push_batch(bad_items)
+
+    def test_invalid_window_raises_value_error(self):
+        for bad in (-1, float('nan'), float('inf'), -float('inf'), True, '10', None):
+            with self.assertRaises(ValueError):
+                self.cache.push_batch([('d1', 'e1', 10), ('d2', 'e2', bad)])
+
+    def test_validation_failure_changes_nothing(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push('pre', 'pre-event', 100)
+        values_before = dict(self.cache.values)
+        seen_before = dict(self.cache.seen)
+        events_before = list(self.cache.events)
+        self.calls.clear()
+        for bad_items in (
+            None,
+            [('d1', 'e1', 10), ('d2', 'e2', -1)],
+            [('d1', 'e1', 10), ('d2', 'e2')],
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.push_batch(bad_items)
+        self.assertEqual(self.calls, [])  # 校验失败不读取时钟
+        self.assertEqual(self.cache.values, values_before)
+        self.assertEqual(self.cache.seen, seen_before)
+        self.assertEqual(list(self.cache.events), events_before)
+
+    def test_late_invalid_item_means_no_partial_results(self):
+        # 前两项本可接受，但第三项非法：整批失败且无部分写入
+        try:
+            self.cache.push_batch([
+                ('d1', 'e1', 10),
+                ('d2', 'e2', 10),
+                ('d3', 'e3', 'bad'),
+            ])
+        except ValueError:
+            pass
+        else:
+            self.fail('ValueError expected')
+        self.assertEqual(list(self.cache.events), [])
+        self.assertEqual(self.cache.seen, {})
+        self.assertIsNone(self.cache.pop())
+
+    # ---- 不隐式 cleanup / 不改变生命周期 ----
+    def test_batch_does_not_implicitly_cleanup(self):
+        self.cache.push('old', 'old-event', 5)
+        self.advance(10)  # old 的去重记录已到期但未清理
+        results = self.cache.push_batch([('new', 'new-event', 10)])
+        self.assertTrue(results[0].accepted)
+        self.assertIn('old', self.cache.seen)  # 未触发清理
+        self.advance(100)
+        # 已排队事件生命周期不受时间推进影响
+        self.assertEqual(
+            [self.cache.pop(), self.cache.pop()], ['old-event', 'new-event']
+        )
+
+    def test_single_entrypoints_behaviour_unchanged(self):
+        self.assertTrue(self.cache.push('d', 'e', 10))
+        self.assertFalse(self.cache.push('d', 'e2', 10))
+        r = self.cache.push_with_reason('d', 'e3', 10)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'dedupe_window')
+        self.assertEqual(self.cache.queue_status().size, 1)
+        self.assertEqual(self.cache.pop(), 'e')
+        self.assertIsNone(self.cache.pop())
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -72,10 +72,8 @@ class EventCache:
         # 已排入队列的事件不受影响
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
-    def _try_push(self, dedupe, event, window):
-        # 校验失败时不读取时钟，也不产生事件或去重记录
-        _check_duration(window, 'window')
-        now = self.clock()
+    def _decide_push(self, dedupe, event, window, now):
+        # 在给定时刻判定一次入队；接受时立即更新 seen 与队列占用
         expiry = self.seen.get(dedupe)
         if expiry is not None and expiry > now:
             return 'dedupe_window'
@@ -87,12 +85,46 @@ class EventCache:
         self.events.append(event)
         return None
 
+    def _try_push(self, dedupe, event, window):
+        # 校验失败时不读取时钟，也不产生事件或去重记录
+        _check_duration(window, 'window')
+        now = self.clock()
+        return self._decide_push(dedupe, event, window, now)
+
     def push(self, dedupe, event, window):
         return self._try_push(dedupe, event, window) is None
 
     def push_with_reason(self, dedupe, event, window):
         reason = self._try_push(dedupe, event, window)
         return Result(accepted=reason is None, reason=reason)
+
+    def push_batch(self, items):
+        # 先完整校验批次结构与每项 window，期间不读取时钟、不改变任何状态
+        try:
+            iterator = iter(items)
+        except TypeError:
+            raise ValueError('items must be an iterable of (dedupe, event, window) triples')
+        normalized = []
+        for item in iterator:
+            try:
+                triple = tuple(item)
+            except TypeError:
+                raise ValueError('each item must be a (dedupe, event, window) triple')
+            if len(triple) != 3:
+                raise ValueError('each item must provide dedupe, event and window')
+            dedupe, event, window = triple
+            _check_duration(window, 'window')
+            normalized.append((dedupe, event, window))
+        # 空批次直接返回，不读取时钟
+        if not normalized:
+            return []
+        # 整批评定共用同一时刻，时间源只读取一次
+        now = self.clock()
+        results = []
+        for dedupe, event, window in normalized:
+            reason = self._decide_push(dedupe, event, window, now)
+            results.append(Result(accepted=reason is None, reason=reason))
+        return results
 
     def pop(self):
         return self.events.popleft() if self.events else None
