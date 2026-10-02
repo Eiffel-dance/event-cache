@@ -21,8 +21,14 @@ def _check_duration(value, name):
 
 
 class EventCache:
-    def __init__(self, clock):
+    def __init__(self, clock, max_queue=None):
+        # None 表示不限容量；否则必须是非负整数，布尔值不视为有效容量
+        if max_queue is not None and (
+            isinstance(max_queue, bool) or not isinstance(max_queue, int) or max_queue < 0
+        ):
+            raise ValueError('max_queue must be None or a non-negative integer')
         self.clock = clock
+        self.max_queue = max_queue
         self.values = {}
         self.events = deque()
         self.seen = {}
@@ -67,8 +73,12 @@ class EventCache:
         _check_duration(window, 'window')
         now = self.clock()
         expiry = self.seen.get(dedupe)
+        # 去重窗口优先于容量：两者同时成立时固定报告 dedupe_window
         if expiry is not None and expiry > now:
             return 'dedupe_window'
+        # 去重已可用但没有空槽位：拒绝且不改动队列与去重记录
+        if self.max_queue is not None and len(self.events) >= self.max_queue:
+            return 'queue_full'
         # 记录不存在或到期点小于等于当前时刻：允许重新入队
         self.seen[dedupe] = now + window
         self.events.append(event)
@@ -83,3 +93,7 @@ class EventCache:
 
     def pop(self):
         return self.events.popleft() if self.events else None
+
+    def queue_status(self):
+        # 纯查询：不读取时钟、不触发清理、不改变队列顺序
+        return Result(size=len(self.events), max_queue=self.max_queue)
