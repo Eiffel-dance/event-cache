@@ -1,9 +1,20 @@
 import math
 from collections import deque
+from collections.abc import Mapping
+
+
+_SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
 
 
 class Result(dict):
     """结果对象：同时支持属性访问 (r.accepted) 与键访问 (r['accepted'])。"""
+
+    def __getattribute__(self, name):
+        # 数据字段优先于 dict 同名内省方法（如字段名恰为 'values'）；
+        # 双下划线名称仍走默认查找，避免干扰 isinstance、拷贝/序列化等机制
+        if isinstance(name, str) and not name.startswith('__') and dict.__contains__(self, name):
+            return dict.__getitem__(self, name)
+        return object.__getattribute__(self, name)
 
     def __getattr__(self, name):
         try:
@@ -243,3 +254,71 @@ class EventCache:
     def queue_status(self):
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
+
+    def snapshot(self):
+        """捕获当前状态的可检查副本。
+
+        纯操作：不读取时钟、不隐式清理，已到期的 values/seen 记录原样保留。
+        返回仅含 values、events、seen、max_queue 四个字段的 Result，支持键访问
+        与属性访问。外层字典与事件列表均为复制，与缓存内部容器分离，双方后续
+        增删互不影响；值对象与二元组按现有接口语义保留同一引用。
+        """
+        # 逐项浅拷贝 (value, expires_at) 二元组本身不可变，复制元组即可保留值引用
+        values = {key: tuple(item) for key, item in self.values.items()}
+        # list(deque) 生成元素为同一引用的新列表
+        events = list(self.events)
+        seen = dict(self.seen)
+        return Result(values=values, events=events, seen=seen, max_queue=self.max_queue)
+
+    def restore(self, snapshot):
+        """从 snapshot() 风格的映射恢复状态，成功返回 None。
+
+        校验在任何状态改动或时钟读取之前全部完成：snapshot 必须是恰含
+        values/events/seen/max_queue 四个字段的映射；values 与 seen 必须是
+        键值对容器（每项解包为二元组，values 的值还须恰为 (value, expires_at)
+        二元组）；events 必须是元素列表；max_queue 必须是 None 或非负整数。
+        结构不符统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
+        恢复一次性复制并替换四个状态字段，已到期记录原样保留，到期判定仍由
+        目标实例当前时间源按 expiry <= now 边界惰性执行。
+        """
+        if not isinstance(snapshot, Mapping):
+            raise ValueError('snapshot must be a mapping with values, events, seen, max_queue')
+        if frozenset(snapshot) != _SNAPSHOT_FIELDS:
+            raise ValueError('snapshot must contain exactly values, events, seen and max_queue')
+        raw_values = snapshot['values']
+        raw_events = snapshot['events']
+        raw_seen = snapshot['seen']
+        max_queue = snapshot['max_queue']
+        # 先完整校验并物化为新容器：在此之前既不触碰现有状态也不读取时钟
+        try:
+            value_items = list(raw_values.items())
+        except AttributeError:
+            raise ValueError("snapshot 'values' must be a mapping of key to (value, expires_at)")
+        values = {}
+        for entry in value_items:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise ValueError("each 'values' entry must be a (key, (value, expires_at)) pair")
+            key, item = entry
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError("each 'values' item must be a (value, expires_at) tuple")
+            values[key] = tuple(item)  # 键不可哈希时原样抛出 TypeError
+        if not isinstance(raw_events, list):
+            raise ValueError("snapshot 'events' must be a list of events")
+        events = deque(raw_events)
+        try:
+            seen_items = list(raw_seen.items())
+        except AttributeError:
+            raise ValueError("snapshot 'seen' must be a mapping of dedupe key to expiry")
+        seen = {}
+        for entry in seen_items:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise ValueError("each 'seen' entry must be a (dedupe_key, expiry) pair")
+            dedupe, expiry = entry
+            seen[dedupe] = expiry  # 键不可哈希时原样抛出 TypeError
+        _check_max_queue(max_queue)
+        # 校验全部通过后一次性替换；不调用时钟、不触发任何清理
+        self.values = values
+        self.events = events
+        self.seen = seen
+        self.max_queue = max_queue
+        return None
