@@ -63,6 +63,56 @@ class DeterministicTest(unittest.TestCase):
         self.assertTrue(self.cache.delete('a'))
         self.assertFalse(self.cache.delete('a'))
 
+    def test_delete_falsy_values_report_existence_not_truthiness(self):
+        # 结果只表达键是否存在：任意假值都与真值一样返回 True
+        for key, value in (('n', None), ('f', False), ('z', 0), ('s', '')):
+            self.cache.put(key, value, 10)
+            self.assertTrue(self.cache.delete(key))
+            self.assertIsNone(self.cache.get(key))
+            self.assertNotIn(key, self.cache.values)
+            self.assertFalse(self.cache.delete(key))  # 再次删除才返回 False
+
+    def test_delete_none_value_then_get_is_none_and_invisible(self):
+        self.cache.put('n', None, 10)
+        self.assertTrue(self.cache.delete('n'))
+        self.assertIsNone(self.cache.get('n'))
+        self.assertNotIn('n', self.cache.values)  # 键不再可见，而非保留为 None
+        self.assertFalse(self.cache.delete('n'))
+
+    def test_delete_expired_falsy_value_returns_true(self):
+        self.cache.put('n', None, 5)
+        self.advance(6)
+        self.assertTrue(self.cache.delete('n'))  # 到期记录仍存在 -> True
+        self.assertFalse(self.cache.delete('n'))
+
+    def test_delete_does_not_read_clock(self):
+        calls = [0]
+        cache = EventCache(lambda: calls.__setitem__(0, calls[0] + 1) or self.now[0])
+        cache.put('a', None, 10)
+        before = calls[0]
+        self.assertTrue(cache.delete('a'))
+        self.assertFalse(cache.delete('missing'))
+        self.assertEqual(calls[0], before)  # 删除不读取注入时钟
+
+    def test_delete_does_not_trigger_batch_cleanup(self):
+        self.cache.put('a', 1, 0)
+        self.cache.push('d', 'e', 0)
+        self.advance(1)  # value 与 seen 均到期，事件仍在队列
+        self.assertFalse(self.cache.delete('missing'))
+        self.assertTrue(self.cache.delete('a'))
+        # 去重记录不被顺带清理，队列顺序不变
+        self.assertIn('d', self.cache.seen)
+        self.assertEqual(self.cache.pop(), 'e')
+
+    def test_delete_unhashable_key_raises_type_error_atomically(self):
+        self.cache.put('a', 'v', 100)
+        self.cache.push('d', 'e', 100)
+        before = (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen))
+        with self.assertRaises(TypeError):
+            self.cache.delete(['unhashable'])
+        after = (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen))
+        self.assertEqual(before, after)  # TypeError 后缓存状态完全不变
+
     # ---- push/pop ----
     def test_push_returns_true_and_fifo(self):
         self.assertTrue(self.cache.push('d1', 'e1', 10))
@@ -529,6 +579,131 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(r.reason, 'dedupe_window')
 
 
+class ApplyBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- delete 结果与单项 delete 完全一致 ----
+    def test_delete_none_value_reports_deleted_true(self):
+        self.cache.put('n', None, 10)
+        results = self.cache.apply_batch([('delete', 'n')])
+        self.assertEqual(results[0].keys(), {'deleted'})
+        self.assertIs(results[0].deleted, True)
+        self.assertIsNone(self.cache.get('n'))
+        self.assertNotIn('n', self.cache.values)
+
+    def test_delete_falsy_values_match_single_delete(self):
+        for key, value in (('n', None), ('f', False), ('z', 0), ('s', '')):
+            single = EventCache(self.clock)
+            single.put(key, value, 10)
+            batched = EventCache(self.clock)
+            batched.put(key, value, 10)
+            self.assertIs(single.delete(key), batched.apply_batch([('delete', key)])[0].deleted)
+
+    def test_repeat_delete_in_batch_reports_false_second_time(self):
+        self.cache.put('n', None, 10)
+        results = self.cache.apply_batch([('delete', 'n'), ('delete', 'n')])
+        self.assertEqual([r.deleted for r in results], [True, False])
+
+    def test_delete_expired_record_in_batch_reports_true(self):
+        self.cache.put('n', None, 5)
+        self.advance(6)
+        results = self.cache.apply_batch([('delete', 'n'), ('delete', 'n')])
+        self.assertEqual([r.deleted for r in results], [True, False])
+
+    # ---- 混合操作按输入顺序处理、字段与时序语义不变 ----
+    def test_mixed_operations_processed_in_order_single_clock_read(self):
+        self.cache.put('k', 'old', 100)
+        self.cache.push('d0', 'e0', 100)
+        ops = [
+            ('put', 'a', None, 10),
+            ('delete', 'k'),
+            ('delete', 'missing'),
+            ('push', 'd1', 'e1', 10),
+            ('cleanup',),
+            ('delete', 'a'),
+        ]
+        before = self.clock_calls[0]
+        results = self.cache.apply_batch(ops)
+        self.assertEqual(self.clock_calls[0] - before, 1)  # 整批只读一次时钟
+        self.assertEqual([set(r) for r in results], [
+            {'accepted', 'reason'},
+            {'deleted'},
+            {'deleted'},
+            {'accepted', 'reason'},
+            {'values_removed', 'dedupe_removed'},
+            {'deleted'},
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertEqual([r.deleted for r in (results[1], results[2], results[5])],
+                         [True, False, True])
+        self.assertTrue(results[3].accepted)
+        self.assertIsNone(results[3].reason)
+        self.assertEqual((results[4].values_removed, results[4].dedupe_removed), (0, 0))
+        self.assertNotIn('k', self.cache.values)
+        self.assertNotIn('a', self.cache.values)
+        self.assertEqual(self.cache.pop_batch(), ['e0', 'e1'])  # FIFO 不受影响
+
+    def test_cleanup_within_batch_affects_later_operations(self):
+        # 同刻先写即到期记录，cleanup 清掉后再删除同键应报 False
+        results = self.cache.apply_batch([
+            ('put', 'a', 'x', 0),
+            ('cleanup',),
+            ('delete', 'a'),
+        ])
+        self.assertEqual(results[1].values_removed, 1)
+        self.assertIs(results[2].deleted, False)
+
+    def test_empty_batch_reads_no_clock_and_changes_nothing(self):
+        self.assertEqual(self.cache.apply_batch([]), [])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    # ---- 失败原子性：校验在读时钟之前 ----
+    def test_invalid_batch_raises_before_clock_and_preserves_state(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push('d0', 'e0', 100)
+        before_state = (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen))
+        for bad, exc in (
+            (None, ValueError),
+            ([[42]], ValueError),
+            ([('unknown',)], ValueError),
+            ([('put', 'k', 'v')], ValueError),
+            ([('push', 'd', 'e', -1)], ValueError),
+            ([('put', 'k', 'v', -1)], ValueError),
+            ([('delete', ['unhashable'])], TypeError),
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(exc):
+                self.cache.apply_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(
+            (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen)),
+            before_state,
+        )
+
+    def test_later_invalid_op_rolls_back_whole_batch(self):
+        for bad, exc in (
+            ([('put', 'a', 1, 10), ('push', 'd', 'e', -1)], ValueError),
+            ([('put', 'a', 1, 10), ('delete', ['x'])], TypeError),
+        ):
+            cache = EventCache(self.clock)
+            with self.assertRaises(exc):
+                cache.apply_batch(bad)
+            self.assertEqual(cache.values, {})
+            self.assertEqual(cache.pop_batch(), [])
+
+
 class PopBatchTest(unittest.TestCase):
     def setUp(self):
         self.now = [100]
@@ -942,6 +1117,26 @@ class SnapshotTest(unittest.TestCase):
         self.assertIsNone(target.get('a'))
         self.assertIn('a', target.values)
         self.assertEqual(target.pop_batch(), [None])
+
+    def test_snapshot_preserves_none_value_and_expiry_delete_semantics(self):
+        cache = self.make()
+        cache.put('a', None, 50)    # 到期点 150
+        snap = cache.snapshot()
+        # None 值与其到期时间一并保留
+        self.assertEqual(snap.values['a'], (None, 150))
+
+        target = EventCache(lambda: 100)
+        target.restore(snap)
+        self.assertIn('a', target.values)
+        self.assertTrue(target.delete('a'))       # 未到期的 None 值：删除成功
+        self.assertFalse(target.delete('a'))
+        self.assertIsNone(target.get('a'))
+
+        expired = EventCache(lambda: 150)
+        expired.restore(snap)
+        self.assertIn('a', expired.values)
+        self.assertTrue(expired.delete('a'))      # 已到期记录仍存在：同样删除成功
+        self.assertFalse(expired.delete('a'))
 
 
 if __name__ == '__main__':
