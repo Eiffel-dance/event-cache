@@ -49,6 +49,54 @@ def _parse_batch(batch):
     return entries
 
 
+def _parse_apply_batch(batch):
+    """在读取时钟或改变任何状态前完整解析并校验事务批次。
+
+    批次必须可迭代，每项为带标签的元组：
+    ('put', key, value, ttl)、('delete', key)、
+    ('push', dedupe, event, window) 或 ('cleanup',)。
+    批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window
+    非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为缓存索引时
+    抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
+    """
+    try:
+        iterator = iter(batch)
+    except TypeError:
+        raise ValueError('operations must be an iterable of operation tuples')
+    operations = []
+    for item in iterator:
+        if not isinstance(item, tuple) or len(item) == 0:
+            raise ValueError('each operation must be a tagged tuple')
+        tag = item[0]
+        if tag == 'put':
+            if len(item) != 4:
+                raise ValueError("'put' operation must be ('put', key, value, ttl)")
+            _, key, value, ttl = item
+            _check_duration(ttl, 'ttl')
+            hash(key)  # 不可哈希时原样抛出 TypeError
+            operations.append(('put', key, value, ttl))
+        elif tag == 'delete':
+            if len(item) != 2:
+                raise ValueError("'delete' operation must be ('delete', key)")
+            _, key = item
+            hash(key)
+            operations.append(('delete', key))
+        elif tag == 'push':
+            if len(item) != 4:
+                raise ValueError("'push' operation must be ('push', dedupe, event, window)")
+            _, dedupe, event, window = item
+            _check_duration(window, 'window')
+            hash(dedupe)
+            operations.append(('push', dedupe, event, window))
+        elif tag == 'cleanup':
+            if len(item) != 1:
+                raise ValueError("'cleanup' operation must be ('cleanup',)")
+            operations.append(('cleanup',))
+        else:
+            raise ValueError('unknown operation tag: %r' % (tag,))
+    return operations
+
+
 class EventCache:
     def __init__(self, clock, max_queue=None):
         _check_max_queue(max_queue)
@@ -58,11 +106,14 @@ class EventCache:
         self.events = deque()
         self.seen = {}
 
+    def _put_at(self, key, value, ttl, now):
+        # 以写入时刻加 ttl 记录到期点，并替换同 key 旧值；ttl 由调用方先行校验
+        self.values[key] = (value, now + ttl)
+
     def put(self, key, value, ttl):
         _check_duration(ttl, 'ttl')
         now = self.clock()
-        # 以写入时刻加 ttl 记录到期点，并替换同 key 旧值
-        self.values[key] = (value, now + ttl)
+        self._put_at(key, value, ttl, now)
 
     def get(self, key):
         item = self.values.get(key)
@@ -80,8 +131,7 @@ class EventCache:
         # 无论值是否已过期都移除，返回调用前是否存在该键
         return self.values.pop(key, None) is not None
 
-    def cleanup(self):
-        now = self.clock()
+    def _cleanup_at(self, now):
         values_removed = 0
         for key in [k for k, (_, expiry) in self.values.items() if expiry <= now]:
             del self.values[key]
@@ -91,6 +141,11 @@ class EventCache:
             del self.seen[key]
             dedupe_removed += 1
         # 已排入队列的事件不受影响
+        return values_removed, dedupe_removed
+
+    def cleanup(self):
+        now = self.clock()
+        values_removed, dedupe_removed = self._cleanup_at(now)
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
     def _try_push_at(self, dedupe, event, window, now):
@@ -130,6 +185,35 @@ class EventCache:
                 # 前项已立即更新 seen 与队列占用，后项据此继续判定
                 reason = self._try_push_at(dedupe, event, window, now)
                 results.append(Result(accepted=reason is None, reason=reason))
+        return results
+
+    def apply_batch(self, operations):
+        # 先完整校验批次结构、标签、时长及键：在此之前不读取时钟、不改变任何状态
+        parsed = _parse_apply_batch(operations)
+        results = []
+        if parsed:
+            # 整批使用同一时钟时刻，时间源只读取一次；时钟抛出的异常原样转出
+            now = self.clock()
+            for op in parsed:
+                tag = op[0]
+                if tag == 'put':
+                    _, key, value, ttl = op
+                    self._put_at(key, value, ttl, now)
+                    results.append(Result(accepted=True, reason=None))
+                elif tag == 'delete':
+                    _, key = op
+                    results.append(Result(deleted=self.delete(key)))
+                elif tag == 'push':
+                    _, dedupe, event, window = op
+                    # 前序操作（含 cleanup）已立即更新状态，本项据此在同一时刻判定
+                    reason = self._try_push_at(dedupe, event, window, now)
+                    results.append(Result(accepted=reason is None, reason=reason))
+                else:  # 'cleanup'
+                    values_removed, dedupe_removed = self._cleanup_at(now)
+                    results.append(Result(
+                        values_removed=values_removed,
+                        dedupe_removed=dedupe_removed,
+                    ))
         return results
 
     def pop(self):
