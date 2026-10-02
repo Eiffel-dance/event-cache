@@ -28,6 +28,27 @@ def _check_max_queue(value):
         raise ValueError('max_queue must be None or a non-negative integer')
 
 
+def _parse_batch(batch):
+    """在读取时钟或改变任何状态前完整解析并校验批次。
+
+    批次不可迭代、条目不能解包为三元组或 window 非法时统一抛出 ValueError。
+    返回物化后的 (dedupe, event, window) 列表，供后续在同一时钟时刻逐项判定。
+    """
+    try:
+        iterator = iter(batch)
+    except TypeError:
+        raise ValueError('batch must be an iterable of (dedupe, event, window) triples')
+    entries = []
+    for item in iterator:
+        try:
+            dedupe, event, window = item
+        except (TypeError, ValueError):
+            raise ValueError('each batch entry must be a (dedupe, event, window) triple')
+        _check_duration(window, 'window')
+        entries.append((dedupe, event, window))
+    return entries
+
+
 class EventCache:
     def __init__(self, clock, max_queue=None):
         _check_max_queue(max_queue)
@@ -72,10 +93,8 @@ class EventCache:
         # 已排入队列的事件不受影响
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
-    def _try_push(self, dedupe, event, window):
-        # 校验失败时不读取时钟，也不产生事件或去重记录
-        _check_duration(window, 'window')
-        now = self.clock()
+    def _try_push_at(self, dedupe, event, window, now):
+        # 在指定时钟时刻判定一次入队：window 由调用方先行校验
         expiry = self.seen.get(dedupe)
         if expiry is not None and expiry > now:
             return 'dedupe_window'
@@ -87,12 +106,31 @@ class EventCache:
         self.events.append(event)
         return None
 
+    def _try_push(self, dedupe, event, window):
+        # 校验失败时不读取时钟，也不产生事件或去重记录
+        _check_duration(window, 'window')
+        now = self.clock()
+        return self._try_push_at(dedupe, event, window, now)
+
     def push(self, dedupe, event, window):
         return self._try_push(dedupe, event, window) is None
 
     def push_with_reason(self, dedupe, event, window):
         reason = self._try_push(dedupe, event, window)
         return Result(accepted=reason is None, reason=reason)
+
+    def push_batch(self, batch):
+        # 先完整校验批次结构与每项 window：在此之前不读取时钟、不改变任何状态
+        entries = _parse_batch(batch)
+        results = []
+        if entries:
+            # 整批使用同一时钟时刻，时间源只读取一次
+            now = self.clock()
+            for dedupe, event, window in entries:
+                # 前项已立即更新 seen 与队列占用，后项据此继续判定
+                reason = self._try_push_at(dedupe, event, window, now)
+                results.append(Result(accepted=reason is None, reason=reason))
+        return results
 
     def pop(self):
         return self.events.popleft() if self.events else None
