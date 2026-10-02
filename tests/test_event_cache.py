@@ -1139,5 +1139,357 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(expired.delete('a'))
 
 
+class ExpiringEventTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    # ---- 基本入队与到期点 ----
+    def test_push_expiring_accepted_returns_bool(self):
+        self.assertIs(self.cache.push_expiring('d', 'e', 100, 10), True)
+        self.assertEqual(self.clock_calls[0], 1)
+
+    def test_push_expiring_with_reason_shape(self):
+        r = self.cache.push_expiring_with_reason('d', 'e', 100, 10)
+        self.assertIsInstance(r, Result)
+        self.assertTrue(r.accepted)
+        self.assertIsNone(r.reason)
+
+    def test_expiry_point_is_accept_time_plus_ttl(self):
+        self.cache.push_expiring('d', 'e', 100, 10)
+        self.assertEqual(list(self.cache.event_expiries), [110])
+
+    def test_zero_ttl_means_already_expired_at_accept_time(self):
+        self.cache.push_expiring('d', 'e', 100, 0)
+        # 清理前仍占容量、仍可按序取出
+        self.assertEqual(self.cache.queue_status().size, 1)
+        self.assertEqual(self.cache.cleanup_expired_events().events_removed, 1)
+
+    # ---- 校验失败：ValueError，不读时钟、不改状态 ----
+    def test_invalid_event_ttl_raises_value_error_without_clock(self):
+        self.cache.push('old', 'e0', 100)
+        for bad in (-1, float('nan'), float('inf'), -float('inf'), True, False,
+                    '10', None, 1.0j):
+            with self.assertRaises(ValueError):
+                self.cache.push_expiring('d', 'e', 100, bad)
+            with self.assertRaises(ValueError):
+                self.cache.push_expiring_with_reason('d', 'e', 100, bad)
+        self.assertEqual(self.clock_calls[0], 1)  # 只有先前的旧 push 读过时钟
+        self.assertEqual(self.cache.pop(), 'e0')
+        self.assertIsNone(self.cache.pop())
+        self.assertEqual(self.cache.seen, {'old': 200})
+
+    def test_invalid_window_still_raises_value_error(self):
+        for bad in (-1, float('nan'), True, '10'):
+            with self.assertRaises(ValueError):
+                self.cache.push_expiring('d', 'e', bad, 10)
+
+    def test_unhashable_dedupe_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            self.cache.push_expiring(['d'], 'e', 100, 10)
+        with self.assertRaises(TypeError):
+            self.cache.push_expiring_with_reason({'d': 1}, 'e', 100, 10)
+
+    def test_validation_failure_preserves_state_and_no_clock(self):
+        self.cache.push_expiring('d0', 'e0', 100, 10)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.push_expiring('d1', 'e1', 100, -1)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.pop(), 'e0')
+        self.assertNotIn('d1', self.cache.seen)
+
+    # ---- 去重优先于容量，拒绝不产生任何占用 ----
+    def test_dedupe_window_takes_priority_for_expiring_push(self):
+        cache = self.make(1)
+        cache.push('d1', 'e1', 100)
+        r = cache.push_expiring_with_reason('d1', 'dup', 100, 10)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'dedupe_window')
+
+    def test_queue_full_reason_and_no_dedupe_or_expiry(self):
+        cache = self.make(1)
+        cache.push('d1', 'e1', 100)
+        r = cache.push_expiring_with_reason('d2', 'e2', 100, 10)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertNotIn('d2', cache.seen)
+        self.assertIsNone(cache.event_expiries)
+
+    def test_dedupe_rejection_does_not_extend_seen(self):
+        cache = self.make(1)
+        cache.push_expiring('d1', 'e1', 10, 100)
+        expiry_before = cache.seen['d1']
+        cache.push_expiring_with_reason('d1', 'dup', 50, 50)
+        self.assertEqual(cache.seen['d1'], expiry_before)
+
+    # ---- 清理前：容量、FIFO、无后台变化 ----
+    def test_expiring_events_keep_capacity_until_cleanup(self):
+        cache = self.make(2)
+        cache.push_expiring('d1', 'e1', 100, 1)
+        cache.push_expiring('d2', 'e2', 100, 1)
+        self.advance(100)  # 时间流逝本身不释放槽位
+        self.assertEqual(cache.queue_status().size, 2)
+        self.assertEqual(cache.push_with_reason('d3', 'e3', 100).reason, 'queue_full')
+        self.assertEqual(cache.cleanup_expired_events().events_removed, 2)
+        self.assertTrue(cache.push('d3', 'e3', 100))
+
+    def test_pop_does_not_read_clock_and_keeps_fifo(self):
+        self.cache.push('legacy', 'L', 100)
+        self.cache.push_expiring('a', 'A', 100, 1)
+        self.cache.push_expiring('b', 'B', 100, 100)
+        calls_before = self.clock_calls[0]
+        self.advance(50)
+        # 到期事件不被跳过，仍按插入顺序返回
+        self.assertEqual(self.cache.pop(), 'L')
+        self.assertEqual(self.cache.pop_batch(), ['A', 'B'])
+        self.assertEqual(self.clock_calls[0], calls_before)
+
+    def test_pop_keeps_expiry_slots_aligned(self):
+        self.cache.push('a', 1, 100)
+        self.cache.push_expiring('b', 2, 100, 10)
+        self.cache.push('c', 3, 100)
+        self.cache.pop()
+        self.assertEqual(list(self.cache.event_expiries), [110, None])
+        self.cache.pop_batch()
+        self.assertEqual(len(self.cache.event_expiries), 0)
+
+    # ---- cleanup_expired_events ----
+    def test_cleanup_removes_only_expired_and_preserves_order(self):
+        self.cache.put('k', 'v', 0)
+        self.cache.push('sd', 'stays', 0)
+        self.cache.push_expiring('e1', 'A', 100, 10)
+        self.cache.push_expiring('e2', 'B', 100, 30)
+        self.cache.push_expiring('e3', 'C', 100, 5)
+        self.advance(10)  # now=110：A(110)、C(105) 到期，B(130) 未到期
+        calls_before = self.clock_calls[0]
+        r = self.cache.cleanup_expired_events()
+        self.assertEqual(self.clock_calls[0] - calls_before, 1)
+        self.assertEqual(r.events_removed, 2)
+        self.assertEqual(self.cache.pop_batch(), ['stays', 'B'])
+        # values/seen 不被触碰
+        self.assertIn('k', self.cache.values)
+        self.assertIn('sd', self.cache.seen)
+        self.assertIn('e1', self.cache.seen)
+
+    def test_cleanup_expiry_boundary_is_less_than_or_equal(self):
+        self.cache.push_expiring('d', 'e', 0, 10)  # 到期点 110
+        self.now[0] = 109
+        self.assertEqual(self.cache.cleanup_expired_events().events_removed, 0)
+        self.now[0] = 110
+        self.assertEqual(self.cache.cleanup_expired_events().events_removed, 1)
+
+    def test_cleanup_without_expiring_events_reads_clock_once(self):
+        self.cache.push('d', 'legacy', 0)
+        self.advance(100)
+        calls_before = self.clock_calls[0]
+        r = self.cache.cleanup_expired_events()
+        self.assertEqual(r.events_removed, 0)
+        self.assertEqual(self.clock_calls[0] - calls_before, 1)
+        self.assertEqual(self.cache.pop(), 'legacy')  # 旧事件绝不被清理
+
+    def test_cleanup_does_not_touch_dedupe_of_removed_events(self):
+        cache = self.make(1)
+        cache.push_expiring('q', 'Q', 100, 1)  # seen 到期点 200，事件到期点 101
+        self.advance(6)
+        self.assertEqual(cache.cleanup_expired_events().events_removed, 1)
+        self.assertIn('q', cache.seen)  # 去重占用独立保留
+        self.assertEqual(cache.push_with_reason('q', 'Q2', 100).reason, 'dedupe_window')
+
+    def test_repeated_cleanup_is_idempotent(self):
+        self.cache.push_expiring('d', 'e', 100, 10)
+        self.advance(20)
+        self.assertEqual(self.cache.cleanup_expired_events().events_removed, 1)
+        self.assertEqual(self.cache.cleanup_expired_events().events_removed, 0)
+
+    # ---- push_batch 四元组 ----
+    def test_push_batch_accepts_three_and_four_tuples(self):
+        results = self.cache.push_batch([
+            ('d1', 'e1', 100),
+            ('d2', 'e2', 100, 10),
+            ('d3', 'e3', 100, 0),
+        ])
+        self.assertEqual([r.accepted for r in results], [True, True, True])
+        self.assertEqual(self.clock_calls[0], 1)
+        self.assertEqual(list(self.cache.event_expiries), [None, 110, 100])
+
+    def test_push_batch_invalid_event_ttl_is_atomic(self):
+        self.cache.push('d0', 'e0', 100)
+        for bad in (
+            [('d1', 'e1', 100, -1)],
+            [('d1', 'e1', 100), ('d2', 'e2', 100, 'bad')],
+            [('d1', 'e1', 100, 10, 20)],                 # 五元组
+            [('d1', 'e1')],                              # 二元组
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.push_batch(bad)
+        self.assertEqual(self.clock_calls[0], 1)
+        self.assertEqual(self.cache.pop(), 'e0')
+        self.assertIsNone(self.cache.pop())
+
+    def test_push_batch_unhashable_dedupe_in_four_tuple_is_atomic(self):
+        with self.assertRaises(TypeError):
+            self.cache.push_batch([(['d1'], 'e1', 100, 10)])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_push_batch_results_align_and_single_clock_on_validation_pass(self):
+        results = self.cache.push_batch([('d%d' % i, 'e%d' % i, 100, i) for i in range(4)])
+        self.assertEqual(len(results), 4)
+        self.assertEqual(self.clock_calls[0], 1)
+        self.advance(2)
+        self.assertEqual(self.cache.cleanup_expired_events().events_removed, 3)
+        self.assertEqual(self.cache.pop_batch(), ['e3'])
+
+    # ---- apply_batch push_expiring ----
+    def test_apply_batch_push_expiring_operation(self):
+        results = self.cache.apply_batch([
+            ('push', 'd0', 'old', 100),
+            ('push_expiring', 'd1', 'new', 100, 10),
+        ])
+        self.assertEqual([set(r) for r in results],
+                         [{'accepted', 'reason'}, {'accepted', 'reason'}])
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertEqual(self.clock_calls[0], 1)
+        self.assertEqual(list(self.cache.event_expiries), [None, 110])
+
+    def test_apply_batch_push_expiring_reports_reasons(self):
+        cache = self.make(1)
+        cache.push('d0', 'old', 100)
+        results = cache.apply_batch([
+            ('push_expiring', 'd0', 'dup', 100, 10),    # dedupe_window
+            ('push_expiring', 'd1', 'new', 100, 10),    # queue_full
+        ])
+        self.assertEqual([r.reason for r in results],
+                         ['dedupe_window', 'queue_full'])
+        self.assertNotIn('d1', cache.seen)
+
+    def test_apply_batch_invalid_expiring_op_is_atomic(self):
+        self.cache.push('d0', 'e0', 100)
+        for bad, exc in (
+            ([('push_expiring', 'd', 'e', 10)], ValueError),          # 缺 ttl
+            ([('push_expiring', 'd', 'e', 10, 20, 30)], ValueError),  # 多参数
+            ([('push_expiring', 'd', 'e', -1, 10)], ValueError),
+            ([('push_expiring', 'd', 'e', 10, -1)], ValueError),
+            ([('push_expiring', ['d'], 'e', 10, 10)], TypeError),
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(exc):
+                self.cache.apply_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.pop(), 'e0')
+
+    # ---- 快照格式 ----
+    def test_snapshot_without_ttl_events_keeps_four_fields(self):
+        self.cache.push('d', 'legacy', 100)
+        snap = self.cache.snapshot()
+        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        self.assertIsNone(snap.event_expiries)
+
+    def test_snapshot_with_ttl_events_adds_aligned_field(self):
+        self.cache.push('d0', 'legacy', 100)
+        self.cache.push_expiring('d1', 'temp', 100, 5)
+        self.cache.push_expiring('d2', 'later', 100, 50)
+        snap = self.cache.snapshot()
+        self.assertEqual(set(snap),
+                         {'values', 'events', 'seen', 'max_queue', 'event_expiries'})
+        self.assertEqual(snap.events, ['legacy', 'temp', 'later'])
+        self.assertEqual(snap.event_expiries, [None, 105, 150])
+
+    def test_snapshot_expiries_list_is_detached(self):
+        self.cache.push_expiring('d', 'e', 100, 10)
+        snap = self.cache.snapshot()
+        snap['event_expiries'].append(999)
+        self.assertEqual(len(self.cache.event_expiries), 1)
+
+    def test_restore_accepts_old_and_new_formats(self):
+        self.cache.push('d0', 'legacy', 100)
+        self.cache.push_expiring('d1', 'temp', 100, 10)
+        snap = self.cache.snapshot()
+
+        target = EventCache(lambda: 0)
+        self.assertIsNone(target.restore(snap))
+        self.assertEqual(list(target.event_expiries), [None, 110])
+        self.assertEqual(target.pop_batch(), ['legacy', 'temp'])
+
+        old = {'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None}
+        target2 = EventCache(lambda: 0)
+        target2.restore(old)
+        self.assertIsNone(target2.event_expiries)
+        self.assertEqual(target2.pop(), 'a')
+
+    def test_restore_judges_event_expiry_by_target_clock(self):
+        snap = {
+            'values': {}, 'events': ['x', 'y'], 'seen': {}, 'max_queue': None,
+            'event_expiries': [105, 150],
+        }
+        target = EventCache(lambda: 110)
+        target.restore(snap)
+        self.assertEqual(target.cleanup_expired_events().events_removed, 1)
+        self.assertEqual(target.pop(), 'y')
+
+    def test_restore_rejects_bad_event_expiries(self):
+        self.cache.push('keep', 'kept', 100)
+        base = {'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None}
+        for bad in (
+            dict(base, event_expiries=[]),                    # 长度不一致
+            dict(base, event_expiries={}),                    # 非列表
+            dict(base, event_expiries=('x',)),                # 非列表
+            dict(base, event_expiries=['soon']),              # 非数值
+            dict(base, event_expiries=[float('nan')]),        # 非有限
+            dict(base, event_expiries=[float('inf')]),
+            dict(base, event_expiries=[True]),                # 布尔不算
+            dict(base, event_expiries=None),                  # 字段须为列表
+            dict(base, event_expiries=[1], extra=2),          # 多余字段
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.restore(bad)
+        self.assertEqual(self.cache.pop(), 'kept')
+
+    def test_restore_all_none_expiries_normalizes_to_legacy(self):
+        target = EventCache(lambda: 0)
+        target.restore({
+            'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': None,
+            'event_expiries': [None, None],
+        })
+        self.assertIsNone(target.event_expiries)
+        self.assertEqual(target.pop_batch(), ['a', 'b'])
+
+    def test_restore_copies_expiry_container(self):
+        self.cache.push_expiring('d', 'e', 100, 10)
+        snap = self.cache.snapshot()
+        target = EventCache(lambda: 0)
+        target.restore(snap)
+        snap['event_expiries'][0] = 1
+        self.assertEqual(list(target.event_expiries), [110])
+
+    def test_round_trip_snapshot_equivalence(self):
+        self.cache.push('l', 'L', 100)
+        self.cache.push_expiring('t', 'T', 100, 10)
+        rebuilt = EventCache(lambda: 0)
+        rebuilt.restore(self.cache.snapshot())
+        self.assertEqual(rebuilt.snapshot(), self.cache.snapshot())
+
+    def test_snapshot_collapses_to_four_fields_after_all_expire(self):
+        self.cache.push('l', 'L', 100)
+        self.cache.push_expiring('t', 'T', 100, 10)
+        self.advance(50)
+        self.cache.cleanup_expired_events()
+        snap = self.cache.snapshot()
+        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        self.assertEqual(snap.events, ['L'])
+
+
 if __name__ == '__main__':
     unittest.main()
