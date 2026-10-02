@@ -196,8 +196,13 @@ class EventCache:
         return value
 
     def delete(self, key):
-        # 无论值是否已过期都移除，返回调用前是否存在该键
-        return self.values.pop(key, None) is not None
+        # 以键是否存在为唯一判定依据：值可以是 None/False/0 等任意对象，
+        # 不能通过取出的值推断键是否存在。无论记录是否已到期都移除。
+        # 不读取时钟、不触发清理；不可哈希的键由 in 原样抛出 TypeError，状态不变
+        if key in self.values:
+            del self.values[key]
+            return True
+        return False
 
     def _cleanup_at(self, now):
         values_removed = 0
