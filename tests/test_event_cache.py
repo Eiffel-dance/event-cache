@@ -150,5 +150,117 @@ class DeterministicTest(unittest.TestCase):
         self.assertEqual([self.cache.pop(), self.cache.pop()], ['e1', 'e2'])
 
 
+class CapacityTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+
+    def make(self, max_queue):
+        return EventCache(lambda: self.now[0], max_queue=max_queue)
+
+    # ---- 构造参数校验 ----
+    def test_omitted_max_queue_means_unlimited(self):
+        cache = EventCache(lambda: self.now[0])
+        self.assertIsNone(cache.max_queue)
+        for i in range(100):
+            self.assertTrue(cache.push('d%d' % i, 'e%d' % i, 10))
+
+    def test_none_max_queue_means_unlimited(self):
+        cache = self.make(None)
+        self.assertIsNone(cache.max_queue)
+        for i in range(100):
+            self.assertTrue(cache.push('d%d' % i, 'e%d' % i, 10))
+
+    def test_invalid_max_queue_raises(self):
+        for bad in (-1, -100, True, False, 1.5, 2.0, '3', [], object()):
+            with self.assertRaises(ValueError):
+                self.make(bad)
+
+    def test_zero_max_queue_rejects_everything(self):
+        cache = self.make(0)
+        self.assertFalse(cache.push('d', 'e', 10))
+        r = cache.push_with_reason('d', 'e', 10)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertIsNone(cache.pop())
+        self.assertEqual(cache.seen, {})  # 拒绝不登记去重占用
+
+    # ---- 容量上限 ----
+    def test_queue_full_after_limit_reached(self):
+        cache = self.make(2)
+        self.assertTrue(cache.push('d1', 'e1', 10))
+        self.assertTrue(cache.push('d2', 'e2', 10))
+        self.assertFalse(cache.push('d3', 'e3', 10))
+        r = cache.push_with_reason('d3', 'e3', 10)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertEqual([cache.pop(), cache.pop()], ['e1', 'e2'])
+        self.assertIsNone(cache.pop())
+
+    def test_rejection_does_not_create_or_extend_dedupe(self):
+        cache = self.make(1)
+        cache.push('d1', 'e1', 10)
+        cache.push_with_reason('d2', 'e2', 5)  # 因 queue_full 被拒
+        self.assertNotIn('d2', cache.seen)     # 未创建新的去重占用
+        expiry_before = cache.seen['d1']
+        cache.push_with_reason('d1', 'e1-dup', 50)  # dedupe_window 优先
+        self.assertEqual(cache.seen['d1'], expiry_before)  # 旧占用未延长
+
+    def test_dedupe_window_takes_priority_over_queue_full(self):
+        cache = self.make(1)
+        cache.push('d1', 'e1', 100)
+        r = cache.push_with_reason('d1', 'e1-dup', 100)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'dedupe_window')
+
+    def test_pop_frees_slot_for_next_push(self):
+        cache = self.make(1)
+        cache.push('d1', 'e1', 0)
+        self.assertFalse(cache.push('d2', 'e2', 0))
+        self.assertEqual(cache.pop(), 'e1')
+        self.assertTrue(cache.push('d2', 'e2', 0))  # 释放槽位后立即可入队
+        self.assertEqual(cache.pop(), 'e2')
+
+    def test_cleanup_does_not_free_slots(self):
+        cache = self.make(1)
+        cache.push('d1', 'e1', 5)
+        self.now[0] += 10  # 去重记录到期
+        result = cache.cleanup()
+        self.assertEqual(result.dedupe_removed, 1)
+        self.assertFalse(cache.push('d2', 'e2', 5))  # 事件未出队，槽位仍被占用
+        self.assertEqual(cache.pop(), 'e1')
+
+    # ---- queue_status ----
+    def test_queue_status_unlimited(self):
+        cache = self.make(None)
+        s = cache.queue_status()
+        self.assertEqual(s.size, 0)
+        self.assertIsNone(s.max_queue)
+        self.assertIsNone(s['max_queue'])
+        cache.push('d', 'e', 10)
+        self.assertEqual(cache.queue_status()['size'], 1)
+
+    def test_queue_status_limited(self):
+        cache = self.make(3)
+        cache.push('d1', 'e1', 10)
+        cache.push('d2', 'e2', 10)
+        s = cache.queue_status()
+        self.assertEqual(s.size, 2)
+        self.assertEqual(s.max_queue, 3)
+        cache.pop()
+        self.assertEqual(cache.queue_status().size, 1)
+
+    def test_queue_status_is_pure_query(self):
+        calls = []
+        cache = EventCache(lambda: calls.append(1) or self.now[0], max_queue=1)
+        cache.push('d', 'e', 0)
+        calls.clear()
+        self.now[0] += 10  # 去重记录已到期，但查询不得触发清理
+        s = cache.queue_status()
+        self.assertEqual(calls, [])  # 未读取时钟
+        self.assertEqual(s.size, 1)
+        self.assertIn('d', cache.seen)  # 未触发清理
+        self.assertEqual(cache.pop(), 'e')  # 队列顺序未变
+
+
 if __name__ == '__main__':
     unittest.main()
