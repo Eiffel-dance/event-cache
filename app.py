@@ -3,6 +3,7 @@ from collections import deque
 from collections.abc import Mapping
 
 _SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
+_SNAPSHOT_FIELDS_WITH_EXPIRIES = _SNAPSHOT_FIELDS | frozenset(('event_expiries',))
 
 
 class Result(dict):
@@ -56,9 +57,12 @@ def _check_max_queue(value):
 def _parse_batch(batch):
     """在读取时钟或改变任何状态前完整解析并校验批次。
 
-    批次不可迭代、条目不能解包为三元组或 window 非法时统一抛出 ValueError；
-    dedupe 不可哈希、无法作为去重索引时抛出 TypeError。
-    返回物化后的 (dedupe, event, window) 列表，供后续在同一时钟时刻逐项判定。
+    每项为 (dedupe, event, window) 三元组，或追加 event_ttl 的
+    (dedupe, event, window, event_ttl) 四元组。批次不可迭代、条目长度不符
+    或 window/event_ttl 非法时统一抛出 ValueError；dedupe 不可哈希、无法
+    作为去重索引时抛出 TypeError。返回物化后的 (dedupe, event, window,
+    event_ttl) 列表（三元组项的 event_ttl 为 None），供后续在同一时钟
+    时刻逐项判定。
     """
     try:
         iterator = iter(batch)
@@ -67,12 +71,20 @@ def _parse_batch(batch):
     entries = []
     for item in iterator:
         try:
-            dedupe, event, window = item
-        except (TypeError, ValueError):
+            members = tuple(item)
+        except TypeError:
+            raise ValueError('each batch entry must be a (dedupe, event, window) triple')
+        if len(members) == 3:
+            dedupe, event, window = members
+            event_ttl = None
+        elif len(members) == 4:
+            dedupe, event, window, event_ttl = members
+            _check_duration(event_ttl, 'event_ttl')
+        else:
             raise ValueError('each batch entry must be a (dedupe, event, window) triple')
         _check_duration(window, 'window')
         hash(dedupe)  # 不可哈希时原样抛出 TypeError
-        entries.append((dedupe, event, window))
+        entries.append((dedupe, event, window, event_ttl))
     return entries
 
 
@@ -81,10 +93,11 @@ def _parse_apply_batch(batch):
 
     批次必须可迭代，每项为带标签的元组：
     ('put', key, value, ttl)、('delete', key)、
-    ('push', dedupe, event, window) 或 ('cleanup',)。
-    批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window
-    非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为缓存索引时
-    抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
+    ('push', dedupe, event, window)、
+    ('push_expiring', dedupe, event, window, event_ttl) 或 ('cleanup',)。
+    批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window/
+    event_ttl 非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为
+    缓存索引时抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
     """
     try:
         iterator = iter(batch)
@@ -115,6 +128,15 @@ def _parse_apply_batch(batch):
             _check_duration(window, 'window')
             hash(dedupe)
             operations.append(('push', dedupe, event, window))
+        elif tag == 'push_expiring':
+            if len(item) != 5:
+                raise ValueError(
+                    "'push_expiring' operation must be ('push_expiring', dedupe, event, window, event_ttl)")
+            _, dedupe, event, window, event_ttl = item
+            _check_duration(window, 'window')
+            _check_duration(event_ttl, 'event_ttl')
+            hash(dedupe)
+            operations.append(('push_expiring', dedupe, event, window, event_ttl))
         elif tag == 'cleanup':
             if len(item) != 1:
                 raise ValueError("'cleanup' operation must be ('cleanup',)")
@@ -127,16 +149,20 @@ def _parse_apply_batch(batch):
 def _parse_snapshot(snapshot):
     """在读取时钟或改变任何状态前完整解析并校验快照。
 
-    快照必须是恰好含 values、events、seen、max_queue 四个字段的映射：
-    values 为 key -> (value, expires_at) 的映射，seen 为去重键 -> 绝对到期
-    时间的映射，events 为事件列表（按 FIFO 顺序），max_queue 为 None 或
-    非负整数。字段缺失或多余、非映射/列表容器、二元组结构不符或 max_queue
-    非法时统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
+    快照必须是含 values、events、seen、max_queue 四个字段的映射，或在此
+    基础上增加与 events 对齐的 event_expiries 字段：values 为
+    key -> (value, expires_at) 的映射，seen 为去重键 -> 绝对到期时间的
+    映射，events 为事件列表（按 FIFO 顺序），max_queue 为 None 或非负
+    整数，event_expiries 为与 events 等长的列表，每项为 None（无事件
+    TTL）或有限的绝对到期时刻。字段缺失或多余、非映射/列表容器、二元组
+    结构不符、event_expiries 长度不一致或含无效到期信息、max_queue 非法
+    时统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
     校验期间一次性物化为全新的 dict/list/deque，供调用方随后整体替换状态。
     """
     if not isinstance(snapshot, Mapping):
         raise ValueError('snapshot must be a mapping with values, events, seen, max_queue')
-    if frozenset(snapshot.keys()) != _SNAPSHOT_FIELDS:
+    fields = frozenset(snapshot.keys())
+    if fields != _SNAPSHOT_FIELDS and fields != _SNAPSHOT_FIELDS_WITH_EXPIRIES:
         raise ValueError('snapshot must contain exactly values, events, seen, max_queue')
 
     raw_values = snapshot['values']
@@ -162,7 +188,25 @@ def _parse_snapshot(snapshot):
         seen[key] = expiry
     # list() 物化事件副本；值与事件对象按既有语义保留引用
     events = deque(raw_events)
-    return values, events, seen, snapshot['max_queue']
+    if 'event_expiries' in snapshot:
+        raw_expiries = snapshot['event_expiries']
+        if not isinstance(raw_expiries, list):
+            raise ValueError('snapshot event_expiries must be a list')
+        if len(raw_expiries) != len(raw_events):
+            raise ValueError('snapshot event_expiries must align with events in length')
+        event_expiries = deque()
+        for expiry in raw_expiries:
+            if expiry is not None and (
+                isinstance(expiry, bool)
+                or not isinstance(expiry, (int, float))
+                or not math.isfinite(expiry)
+            ):
+                raise ValueError('each event_expiries entry must be None or a finite expiry time')
+            event_expiries.append(expiry)
+    else:
+        # 旧格式快照：所有事件均无 TTL
+        event_expiries = deque([None] * len(raw_events))
+    return values, events, event_expiries, seen, snapshot['max_queue']
 
 
 class EventCache:
@@ -172,6 +216,8 @@ class EventCache:
         self.max_queue = max_queue
         self.values = {}
         self.events = deque()
+        # 与 events 逐元素对齐：None 表示无事件 TTL，否则为绝对到期时刻
+        self.event_expiries = deque()
         self.seen = {}
 
     def _put_at(self, key, value, ttl, now):
@@ -224,8 +270,29 @@ class EventCache:
         values_removed, dedupe_removed = self._cleanup_at(now)
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
-    def _try_push_at(self, dedupe, event, window, now):
-        # 在指定时钟时刻判定一次入队：window 由调用方先行校验
+    def cleanup_expired_events(self):
+        """单次读取时钟，移除所有已到期的带 TTL 事件。
+
+        到期边界与 values/seen 一致：到期点 <= 当前时刻即移除。未到期事件
+        与未设置事件 TTL 的旧事件一律保留且相对顺序不变；values、seen 与
+        max_queue 不受影响。返回 Result(events_removed=移除数量)。
+        """
+        now = self.clock()
+        kept_events = deque()
+        kept_expiries = deque()
+        events_removed = 0
+        for event, expiry in zip(self.events, self.event_expiries):
+            if expiry is not None and expiry <= now:
+                events_removed += 1
+            else:
+                kept_events.append(event)
+                kept_expiries.append(expiry)
+        self.events = kept_events
+        self.event_expiries = kept_expiries
+        return Result(events_removed=events_removed)
+
+    def _try_push_at(self, dedupe, event, window, now, event_ttl=None):
+        # 在指定时钟时刻判定一次入队：window/event_ttl 由调用方先行校验
         expiry = self.seen.get(dedupe)
         if expiry is not None and expiry > now:
             return 'dedupe_window'
@@ -235,6 +302,8 @@ class EventCache:
         # 记录不存在或到期点小于等于当前时刻：允许重新入队
         self.seen[dedupe] = now + window
         self.events.append(event)
+        # 事件到期时刻 = 接受时刻 + event_ttl；event_ttl 为零即接受时已到期
+        self.event_expiries.append(None if event_ttl is None else now + event_ttl)
         return None
 
     def _try_push(self, dedupe, event, window):
@@ -250,16 +319,31 @@ class EventCache:
         reason = self._try_push(dedupe, event, window)
         return Result(accepted=reason is None, reason=reason)
 
+    def push_expiring(self, dedupe, event, window, event_ttl):
+        return self._try_push_expiring(dedupe, event, window, event_ttl) is None
+
+    def push_expiring_with_reason(self, dedupe, event, window, event_ttl):
+        reason = self._try_push_expiring(dedupe, event, window, event_ttl)
+        return Result(accepted=reason is None, reason=reason)
+
+    def _try_push_expiring(self, dedupe, event, window, event_ttl):
+        # event_ttl 为必选时长：None 等非法值同样在校验阶段抛出 ValueError，
+        # 校验失败时不读取时钟，也不产生事件或去重记录
+        _check_duration(window, 'window')
+        _check_duration(event_ttl, 'event_ttl')
+        now = self.clock()
+        return self._try_push_at(dedupe, event, window, now, event_ttl)
+
     def push_batch(self, batch):
-        # 先完整校验批次结构、每项 window 及 dedupe 可哈希性：在此之前不读取时钟、不改变任何状态
+        # 先完整校验批次结构、每项 window/event_ttl 及 dedupe 可哈希性：在此之前不读取时钟、不改变任何状态
         entries = _parse_batch(batch)
         results = []
         if entries:
             # 整批使用同一时钟时刻，时间源只读取一次
             now = self.clock()
-            for dedupe, event, window in entries:
+            for dedupe, event, window, event_ttl in entries:
                 # 前项已立即更新 seen 与队列占用，后项据此继续判定
-                reason = self._try_push_at(dedupe, event, window, now)
+                reason = self._try_push_at(dedupe, event, window, now, event_ttl)
                 results.append(Result(accepted=reason is None, reason=reason))
         return results
 
@@ -284,6 +368,10 @@ class EventCache:
                     # 前序操作（含 cleanup）已立即更新状态，本项据此在同一时刻判定
                     reason = self._try_push_at(dedupe, event, window, now)
                     results.append(Result(accepted=reason is None, reason=reason))
+                elif tag == 'push_expiring':
+                    _, dedupe, event, window, event_ttl = op
+                    reason = self._try_push_at(dedupe, event, window, now, event_ttl)
+                    results.append(Result(accepted=reason is None, reason=reason))
                 else:  # 'cleanup'
                     values_removed, dedupe_removed = self._cleanup_at(now)
                     results.append(Result(
@@ -293,7 +381,10 @@ class EventCache:
         return results
 
     def pop(self):
-        return self.events.popleft() if self.events else None
+        if not self.events:
+            return None
+        self.event_expiries.popleft()
+        return self.events.popleft()
 
     def pop_batch(self, limit=None):
         """按 FIFO 从队头批量取出事件。
@@ -312,7 +403,11 @@ class EventCache:
                 raise ValueError('limit must be None or a non-negative integer')
             count = min(limit, len(self.events))
         # 逐个 popleft 与连续调用 pop 的顺序和元素完全一致，事件为 None 也原样保留
-        return [self.events.popleft() for _ in range(count)]
+        taken = []
+        for _ in range(count):
+            taken.append(self.events.popleft())
+            self.event_expiries.popleft()
+        return taken
 
     def queue_status(self):
         # 纯查询：不读取时钟、不触发清理、不改变队列
@@ -322,29 +417,36 @@ class EventCache:
         """捕获某一时刻的可检查、可恢复状态快照。
 
         纯查询：不读取时钟、不触发任何惰性或显式清理，快照中的过期 values/seen
-        记录与未出队事件一律原样保留。返回只含 values、events、seen、max_queue
-        四个字段的 Result，外层字典与事件列表均为与缓存分离的副本，随后任一方
-        增删都不会影响另一方；value 与事件对象按既有接口语义保留引用。
+        记录与未出队事件一律原样保留。队列中没有带 TTL 事件时返回只含
+        values、events、seen、max_queue 四个字段的 Result；存在带 TTL 事件时
+        增加与 events 对齐的 event_expiries 字段，无 TTL 的旧事件以 None
+        表示。外层字典与事件列表均为与缓存分离的副本，随后任一方增删都不会
+        影响另一方；value 与事件对象按既有接口语义保留引用。
         """
-        return Snapshot(
+        snap = Snapshot(
             values=dict(self.values),
             events=list(self.events),
             seen=dict(self.seen),
             max_queue=self.max_queue,
         )
+        if any(expiry is not None for expiry in self.event_expiries):
+            snap['event_expiries'] = list(self.event_expiries)
+        return snap
 
     def restore(self, snapshot):
-        """从快照一次性恢复 values、events、seen、max_queue。
+        """从快照一次性恢复 values、events、seen、max_queue（及事件到期信息）。
 
         先完整解析并校验快照：在此之前不读取时钟、不改变任何状态，校验失败时
-        原状态、队列顺序和容量完全保持。成功后以副本整体替换四份状态并返回
-        None，恢复出的容器与传入快照相互独立。恢复后一律由本实例当前时间源
-        按既有的 expiry <= now 边界判定过期，不隐式清理、不释放队列槽位、
-        不延长去重窗口。
+        原状态、队列顺序和容量完全保持。接受不含 event_expiries 的旧格式
+        （恢复后所有事件均无 TTL）与含 event_expiries 的新格式。成功后以副本
+        整体替换状态并返回 None，恢复出的容器与传入快照相互独立。恢复后一律
+        由本实例当前时间源按既有的 expiry <= now 边界判定过期，不隐式清理、
+        不释放队列槽位、不延长去重窗口。
         """
-        values, events, seen, max_queue = _parse_snapshot(snapshot)
+        values, events, event_expiries, seen, max_queue = _parse_snapshot(snapshot)
         self.values = values
         self.events = events
+        self.event_expiries = event_expiries
         self.seen = seen
         self.max_queue = max_queue
         return None
