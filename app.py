@@ -31,7 +31,8 @@ def _check_max_queue(value):
 def _parse_batch(batch):
     """在读取时钟或改变任何状态前完整解析并校验批次。
 
-    批次不可迭代、条目不能解包为三元组或 window 非法时统一抛出 ValueError。
+    批次不可迭代、条目不能解包为三元组或 window 非法时统一抛出 ValueError；
+    dedupe 不可哈希、无法作为去重索引时抛出 TypeError。
     返回物化后的 (dedupe, event, window) 列表，供后续在同一时钟时刻逐项判定。
     """
     try:
@@ -45,6 +46,7 @@ def _parse_batch(batch):
         except (TypeError, ValueError):
             raise ValueError('each batch entry must be a (dedupe, event, window) triple')
         _check_duration(window, 'window')
+        hash(dedupe)  # 不可哈希时原样抛出 TypeError
         entries.append((dedupe, event, window))
     return entries
 
@@ -175,7 +177,7 @@ class EventCache:
         return Result(accepted=reason is None, reason=reason)
 
     def push_batch(self, batch):
-        # 先完整校验批次结构与每项 window：在此之前不读取时钟、不改变任何状态
+        # 先完整校验批次结构、每项 window 及 dedupe 可哈希性：在此之前不读取时钟、不改变任何状态
         entries = _parse_batch(batch)
         results = []
         if entries:
