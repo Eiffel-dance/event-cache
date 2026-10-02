@@ -473,5 +473,147 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(r.reason, 'dedupe_window')
 
 
+class PopBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    def seed(self, events, window=100):
+        for i, event in enumerate(events):
+            self.assertTrue(self.cache.push('d%d' % i, event, window))
+        self.clock_calls[0] = 0
+
+    # ---- 基本取出语义 ----
+    def test_default_limit_returns_all_in_fifo_order(self):
+        self.seed(['e1', 'e2', 'e3'])
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2', 'e3'])
+        self.assertEqual(self.cache.queue_status().size, 0)
+        self.assertEqual(self.cache.pop_batch(), [])  # 空队列返回空列表
+
+    def test_zero_limit_returns_empty_and_removes_nothing(self):
+        self.seed(['e1', 'e2'])
+        self.assertEqual(self.cache.pop_batch(0), [])
+        self.assertEqual(self.cache.queue_status().size, 2)
+        self.assertEqual(self.cache.pop(), 'e1')
+
+    def test_limit_smaller_than_size_takes_prefix_only(self):
+        self.seed(['e1', 'e2', 'e3', 'e4'])
+        self.assertEqual(self.cache.pop_batch(2), ['e1', 'e2'])
+        self.assertEqual(self.cache.queue_status().size, 2)
+        self.assertEqual(self.cache.pop_batch(), ['e3', 'e4'])
+
+    def test_limit_larger_than_size_returns_all_without_error(self):
+        self.seed(['e1', 'e2'])
+        self.assertEqual(self.cache.pop_batch(10), ['e1', 'e2'])
+        self.assertEqual(self.cache.queue_status().size, 0)
+
+    def test_explicit_none_limit_returns_all(self):
+        self.seed(['e1', 'e2'])
+        self.assertEqual(self.cache.pop_batch(None), ['e1', 'e2'])
+
+    def test_none_events_are_preserved_as_elements(self):
+        self.seed(['e1', None, 'e3'])
+        self.assertEqual(self.cache.pop_batch(3), ['e1', None, 'e3'])
+
+    def test_returns_list_instance(self):
+        self.seed(['e1'])
+        self.assertIsInstance(self.cache.pop_batch(), list)
+
+    # ---- 与逐次 pop 完全等价 ----
+    def test_matches_single_pop_on_separate_cache(self):
+        events = ['a', None, 'b', None, 'c']
+        self.seed(events)
+        other = EventCache(lambda: self.now[0])
+        for i, event in enumerate(events):
+            other.push('k%d' % i, event, 100)
+        # 批量分段取出与逐次 pop 的顺序和元素逐一相等
+        self.assertEqual(self.cache.pop_batch(2), [other.pop(), other.pop()])
+        self.assertEqual(self.cache.pop_batch(), [other.pop() for _ in range(3)])
+        self.assertEqual(other.pop(), None)
+        self.assertEqual(self.cache.pop_batch(), [])
+
+    # ---- 时间与去重语义不受影响 ----
+    def test_does_not_read_clock(self):
+        self.seed(['e1', 'e2'])
+        self.cache.pop_batch()
+        self.assertEqual(self.clock_calls[0], 0)
+        self.cache.pop_batch(1)
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_does_not_trigger_cleanup(self):
+        self.cache.put('k', 'v', 5)
+        self.cache.push('d0', 'e-old', 5)
+        self.advance(10)  # values 与 seen 均已到期，事件仍在队列中
+        result = self.cache.pop_batch()
+        # 到期事件不被跳过、不重排，按原序取出；到期记录原样保留
+        self.assertEqual(result, ['e-old'])
+        self.assertIn('k', self.cache.values)
+        self.assertIn('d0', self.cache.seen)
+
+    def test_rejected_events_never_appear_in_batch(self):
+        self.assertTrue(self.cache.push('d', 'e1', 100))
+        self.assertFalse(self.cache.push('d', 'rejected', 100))
+        self.assertEqual(self.cache.pop_batch(), ['e1'])
+
+    def test_expired_queued_events_keep_order_in_batch(self):
+        self.cache.push('d1', 'e1', 0)
+        self.advance(5)
+        self.cache.push('d2', 'e2', 100)  # d1 去重已到期，互不影响
+        self.advance(200)                 # 全部去重记录到期，队列不动
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2'])
+
+    # ---- 容量释放 ----
+    def test_popping_batch_frees_slots_for_push(self):
+        cache = self.make(2)
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        self.assertFalse(cache.push('d3', 'e3', 100))
+        self.assertEqual(cache.pop_batch(1), ['e1'])  # 只释放一个槽位
+        self.assertEqual(cache.queue_status().size, 1)
+        self.assertTrue(cache.push('d3', 'e3', 100))
+        self.assertFalse(cache.push('d4', 'e4', 100))  # 仍只剩一个槽位
+        self.assertEqual(cache.pop_batch(), ['e2', 'e3'])
+        self.assertTrue(cache.push('d4', 'e4', 100))
+
+    def test_dedupe_window_still_applies_after_pop(self):
+        cache = self.make(2)
+        cache.push('d1', 'e1', 100)
+        cache.pop_batch()
+        # 槽位已释放，但去重窗口未到期：仍被去重拒绝
+        r = cache.push_with_reason('d1', 'e1-again', 100)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'dedupe_window')
+        self.now[0] += 100  # 到达到期点
+        self.assertTrue(cache.push('d1', 'e1-new', 100))
+
+    # ---- limit 校验 ----
+    def test_invalid_limit_raises_and_removes_nothing(self):
+        self.seed(['e1', 'e2', 'e3'])
+        for bad in (-1, -100, 1.5, 2.0, '3', [3], object(), True, False):
+            with self.assertRaises(ValueError):
+                self.cache.pop_batch(bad)
+        self.assertEqual(self.clock_calls[0], 0)  # 校验失败不读取时钟
+        self.assertEqual(self.cache.queue_status().size, 3)
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2', 'e3'])
+
+    def test_plain_int_limit_accepted(self):
+        self.seed(['e1', 'e2'])
+        self.assertEqual(self.cache.pop_batch(1), ['e1'])
+        self.assertEqual(self.cache.pop_batch(2), ['e2'])
+
+
 if __name__ == '__main__':
     unittest.main()
