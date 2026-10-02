@@ -439,6 +439,66 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(self.clock_calls[0], 0)
         self.assert_state_untouched()
 
+    # ---- 不可哈希 dedupe 的预检 ----
+    def test_unhashable_dedupe_raises_type_error_at_any_position(self):
+        bad_positions = (
+            [(['d'], 'e1', 10), ('d2', 'e2', 10), ('d3', 'e3', 10)],   # 首项
+            [('d1', 'e1', 10), ({'d'}, 'e2', 10), ('d3', 'e3', 10)],   # 中间项
+            [('d1', 'e1', 10), ('d2', 'e2', 10), (['d'], 'e3', 10)],   # 末项
+        )
+        for batch in bad_positions:
+            with self.assertRaises(TypeError):
+                self.cache.push_batch(batch)
+        self.assertEqual(self.clock_calls[0], 0)  # 未读取时钟
+        self.assert_state_untouched()
+
+    def test_unhashable_dedupe_in_generator_changes_nothing(self):
+        def gen():
+            yield ('d1', 'e1', 10)
+            yield (['d2'], 'e2', 10)  # 后段出现不可哈希 dedupe，前段也不得入队
+
+        with self.assertRaises(TypeError):
+            self.cache.push_batch(gen())
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assert_state_untouched()
+
+    def test_unhashable_dedupe_preserves_existing_state(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push('d0', 'e0', 100)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(TypeError):
+            self.cache.push_batch([('d1', 'e1', 10), (['d2'], 'e2', 10)])
+        self.assertEqual(self.clock_calls[0], calls_before)  # 未读取时钟
+        self.assertEqual(self.cache.get('k'), 'v')
+        self.assertEqual(self.cache.pop(), 'e0')
+        self.assertIsNone(self.cache.pop())
+        self.assertEqual(set(self.cache.seen), {'d0'})
+
+    def test_multiple_bad_entries_raise_first_error_only(self):
+        # 同批次含多个错误条目：抛出一个异常即终止，且无任何部分写入
+        with self.assertRaises(ValueError):
+            self.cache.push_batch([
+                ('d1', 'e1', -1),      # window 非法
+                (['d2'], 'e2', 10),    # dedupe 不可哈希
+            ])
+        with self.assertRaises(TypeError):
+            self.cache.push_batch([
+                (['d1'], 'e1', 10),    # dedupe 不可哈希（先出现）
+                ('d2', 'e2', -1),      # window 非法
+            ])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assert_state_untouched()
+
+    def test_hashable_dedupe_types_still_accepted(self):
+        results = self.cache.push_batch([
+            ('str', 'e1', 10),
+            (42, 'e2', 10),
+            ((1, 2), 'e3', 10),
+            (None, 'e4', 10),
+        ])
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertEqual([self.cache.pop() for _ in range(4)], ['e1', 'e2', 'e3', 'e4'])
+
     def test_invalid_batch_preserves_existing_state(self):
         self.cache.put('k', 'v', 100)
         self.cache.push('d0', 'e0', 100)
