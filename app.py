@@ -219,6 +219,18 @@ class EventCache:
     def pop(self):
         return self.events.popleft() if self.events else None
 
+    def pop_batch(self, limit=None):
+        # 先完整校验 limit：失败时不读取时钟、不移除任何事件
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError('limit must be None or a non-negative integer')
+            count = min(limit, len(self.events))
+        else:
+            count = len(self.events)
+        # 纯队列操作：不读时钟、不触发清理，不触及 values/seen/max_queue；
+        # 按 pop 的 FIFO 顺序移除，每条事件恰好释放一个队列容量位置
+        return [self.events.popleft() for _ in range(count)]
+
     def queue_status(self):
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
