@@ -2025,5 +2025,534 @@ class ReplayBatchTest(unittest.TestCase):
         self.assertEqual(target.pop_batch(), ['a'])
 
 
+class ReplayReadPathTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    def seed(self):
+        # 常规路径预置：a 到期点 105；队列 x1(事件到期 105)、m(无 TTL)、x2(事件到期 150)
+        self.cache.put('a', 'v', 5)
+        self.cache.put('n', None, 100)
+        self.cache.push_expiring('d1', 'x1', 100, 5)
+        self.cache.push('d2', 'm', 100)
+        self.cache.push_expiring('d3', 'x2', 100, 50)
+        self.clock_calls[0] = 0
+
+    # ---- 结果与记录严格一一对应、形状与公开入口一致 ----
+    def test_results_align_one_to_one_with_records(self):
+        records = [
+            (100, ('get', 'a')),
+            (100, ('pop',)),
+            (100, ('pop_batch',)),
+            (100, ('peek', 2)),
+            (100, ('pop_live_batch', 1)),
+            (100, ('peek_live_batch',)),
+            (100, ('queue_status',)),
+        ]
+        results = self.cache.replay_batch(records)
+        self.assertEqual(len(results), len(records))
+        self.assertIsNone(results[0])              # get 缺失键：裸 None
+        self.assertIsNone(results[1])              # pop 空队列：裸 None
+        self.assertEqual(results[2], [])           # pop_batch 空队列：空 list
+        self.assertIsInstance(results[2], list)
+        self.assertEqual(results[3], [])
+        self.assertIsInstance(results[3], list)
+        live = results[4]
+        self.assertIsInstance(live, Result)
+        self.assertEqual(set(live), {'events', 'discarded'})
+        self.assertEqual((live.events, live.discarded), ([], []))
+        self.assertIsInstance(live.events, list)
+        self.assertIsInstance(live.discarded, list)
+        self.assertEqual(results[5], Result(events=[], discarded=[]))
+        status = results[6]
+        self.assertIsInstance(status, Result)
+        self.assertEqual(set(status), {'size', 'max_queue'})
+        self.assertEqual((status.size, status.max_queue), (0, None))
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_replay_never_reads_clock_even_for_time_aware_reads(self):
+        def raising_clock():
+            raise AssertionError('replay must not call injected clock')
+
+        cache = EventCache(raising_clock)
+        cache.restore({
+            'values': {'a': ('v', 105)},
+            'events': ['x1', 'm'],
+            'seen': {'d1': 200, 'd2': 200},
+            'max_queue': None,
+            'event_expiries': [105, None],
+        })
+        results = cache.replay_batch([
+            (10, ('get', 'a')),
+            (20, ('pop_live_batch',)),
+            (20, ('peek_live_batch',)),
+            (20, ('queue_status',)),
+        ])
+        # get 按记录时间 10：未到期返回值；pop_live 在 20：x1 未到期（105）仍有效
+        self.assertEqual(results[0], 'v')
+        self.assertEqual(results[1].events, ['x1', 'm'])
+        self.assertEqual(results[1].discarded, [])
+
+    # ---- get：按记录时间判 TTL，边界 <=，惰性删除可被后续记录消费 ----
+    def test_get_uses_record_timestamp_and_boundary(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (104, ('get', 'a')),     # 104 < 105：有效
+            (105, ('get', 'a')),     # 到期点 <= 记录时刻：None 并移除
+            (105, ('get', 'a')),     # 已被上一条移除：None
+        ])
+        self.assertEqual(results, ['v', None, None])
+        self.assertNotIn('a', self.cache.values)
+
+    def test_get_does_not_use_injected_clock(self):
+        self.seed()  # 注入时钟停在 100
+        results = self.cache.replay_batch([(10 ** 6, ('get', 'a'))])
+        self.assertIsNone(results[0])  # 按记录时间判定为已过期
+        self.assertNotIn('a', self.cache.values)
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_get_none_value_is_distinguishable_via_state(self):
+        # 合法的 None 值在到期前原样返回 None，但键仍在 values 中
+        self.seed()
+        self.assertEqual(self.cache.replay_batch([(100, ('get', 'n'))]), [None])
+        self.assertIn('n', self.cache.values)
+        # 到期点 200：边界时刻返回 None 并真正移除
+        self.assertEqual(self.cache.replay_batch([(200, ('get', 'n'))]), [None])
+        self.assertNotIn('n', self.cache.values)
+
+    def test_get_lazy_removal_is_visible_to_later_records(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (105, ('get', 'a')),
+            (105, ('delete', 'a')),   # 已被 get 移除：deleted=False
+        ])
+        self.assertEqual(results[0], None)
+        self.assertIs(results[1].deleted, False)
+
+    def test_get_unhashable_key_raises_type_error_atomically(self):
+        self.seed()
+        before = (dict(self.cache.values), list(self.cache.events))
+        with self.assertRaises(TypeError):
+            self.cache.replay_batch([(1, ('get', ['unhashable']))])
+        self.assertEqual((dict(self.cache.values), list(self.cache.events)), before)
+
+    # ---- pop / pop_batch / peek：不按时间判 TTL ----
+    def test_pop_returns_expired_events_without_judging_time(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (10 ** 6, ('pop',)),     # x1 事件早已到期：仍原样返回
+            (10 ** 6, ('pop_batch',)),  # m、x2 原样按 FIFO 返回
+            (10 ** 6, ('pop',)),     # 空队列 None
+        ])
+        self.assertEqual(results[0], 'x1')
+        self.assertEqual(results[1], ['m', 'x2'])
+        self.assertIsNone(results[2])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_pop_batch_limit_cases_are_deterministic(self):
+        c1 = EventCache(self.clock)
+        c1.replay_batch([
+            (100, ('push_expiring', 'd1', 'x1', 100, 5)),
+            (100, ('push', 'd2', 'm', 100)),
+            (100, ('push_expiring', 'd3', 'x2', 100, 50)),
+        ])
+        results = c1.replay_batch([
+            (100, ('pop_batch', None)),   # 显式 None：全部
+        ])
+        self.assertEqual(results[0], ['x1', 'm', 'x2'])
+        c2 = EventCache(self.clock)
+        c2.replay_batch([
+            (100, ('push_expiring', 'd1', 'x1', 100, 5)),
+            (100, ('push', 'd2', 'm', 100)),
+            (100, ('push_expiring', 'd3', 'x2', 100, 50)),
+        ])
+        results = c2.replay_batch([
+            (100, ('pop_batch', 0)),      # 0：不取
+            (100, ('pop_batch', 2)),      # 小于队列长度：前缀
+            (100, ('pop_batch', 10)),     # 超过队列长度：取剩余
+        ])
+        self.assertEqual(results, [[], ['x1', 'm'], ['x2']])
+
+    def test_peek_cases_never_mutate_queue(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (10 ** 6, ('peek',)),         # 含过期事件的全量前缀
+            (10 ** 6, ('peek', 0)),
+            (10 ** 6, ('peek', 2)),
+            (10 ** 6, ('peek', 99)),
+            (10 ** 6, ('queue_status',)),
+        ])
+        self.assertEqual(results[0], ['x1', 'm', 'x2'])
+        self.assertEqual(results[1], [])
+        self.assertEqual(results[2], ['x1', 'm'])
+        self.assertEqual(results[3], ['x1', 'm', 'x2'])
+        self.assertEqual(results[4].size, 3)  # peek 不释放任何槽位
+        self.assertEqual(list(self.cache.events), ['x1', 'm', 'x2'])
+
+    def test_none_events_are_preserved_through_replay_reads(self):
+        self.cache.push('d', None, 100)
+        self.clock_calls[0] = 0
+        self.assertEqual(self.cache.replay_batch([(1, ('peek', 1))]), [[None]])
+        self.assertEqual(self.cache.replay_batch([(1, ('pop',))]), [None])
+        self.assertEqual(self.cache.replay_batch([(1, ('pop',))]), [None])
+
+    # ---- pop_live_batch / peek_live_batch：记录时间驱动 ----
+    def test_live_batches_judge_event_ttl_at_record_time(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (104, ('peek_live_batch',)),   # x1 104<105 仍有效
+            (105, ('peek_live_batch',)),   # 边界：x1 进 discarded
+        ])
+        self.assertEqual(results[0].events, ['x1', 'm', 'x2'])
+        self.assertEqual(results[0].discarded, [])
+        self.assertEqual(results[1].events, ['m', 'x2'])
+        self.assertEqual([d.event for d in results[1].discarded], ['x1'])
+        self.assertTrue(all(d.reason == 'event_ttl' for d in results[1].discarded))
+        self.assertIsInstance(results[1].discarded[0], Result)
+        self.assertEqual(self.cache.queue_status().size, 3)  # peek 不出队
+
+    def test_peek_live_does_not_release_slots_or_consume_events(self):
+        cache = self.make(1)
+        cache.replay_batch([
+            (10, ('push_expiring', 'd1', 'x', 100, 0)),  # 接受即到期
+            (20, ('peek_live_batch',)),
+        ])
+        self.assertEqual(list(cache.events), ['x'])  # 原样保留
+        results = cache.replay_batch([
+            (20, ('peek_live_batch',)),
+            (20, ('push', 'd2', 'e', 10)),            # 槽位未释放：queue_full
+        ])
+        self.assertEqual([d.event for d in results[0].discarded], ['x'])
+        self.assertEqual(results[1].reason, 'queue_full')
+
+    def test_pop_live_removes_scanned_items_and_delivers_by_limit(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (105, ('pop_live_batch', 1)),  # x1 过期丢弃；m 为第 1 个有效事件即停；x2 不扫描
+            (105, ('queue_status',)),
+            (105, ('peek',)),              # 未扫描尾项 x2 原样保留
+        ])
+        self.assertEqual(results[0].events, ['m'])
+        self.assertEqual([d.event for d in results[0].discarded], ['x1'])
+        self.assertEqual(results[1].size, 1)
+        self.assertEqual(results[2], ['x2'])
+
+    def test_pop_live_unscanned_expired_items_are_not_silently_cleaned(self):
+        self.seed()
+        # limit=1：x1 过期被扫描丢弃、m 有效即停；x2 在 t=105 未到期但在 t=200 到期，
+        # 先后续记录推进到 200，x2 必须仍在队列并在那时被识别为过期
+        results = self.cache.replay_batch([
+            (105, ('pop_live_batch', 1)),
+            (200, ('peek_live_batch',)),  # 不凭空清理：此刻才报告 x2 过期
+            (200, ('pop_live_batch',)),   # 真正出队丢弃
+            (200, ('queue_status',)),
+        ])
+        self.assertEqual([d.event for d in results[1].discarded], ['x2'])
+        self.assertEqual(results[2].events, [])
+        self.assertEqual([d.event for d in results[2].discarded], ['x2'])
+        self.assertEqual(results[3].size, 0)
+
+    def test_live_batches_zero_limit_and_empty_queue(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (105, ('pop_live_batch', 0)),
+            (105, ('peek_live_batch', 0)),
+        ])
+        self.assertEqual(results, [Result(events=[], discarded=[]),
+                                   Result(events=[], discarded=[])])
+        self.assertEqual(self.cache.queue_status().size, 3)  # 零配额不改状态
+        self.cache.replay_batch([(105, ('pop_batch',))])
+        again = self.cache.replay_batch([
+            (105, ('pop_live_batch',)),
+            (105, ('peek_live_batch', 5)),
+        ])
+        self.assertEqual(again, [Result(events=[], discarded=[]),
+                                 Result(events=[], discarded=[])])
+
+    def test_discarded_event_frees_slot_but_dedupe_window_remains(self):
+        cache = self.make(1)
+        results = cache.replay_batch([
+            (10, ('push_expiring', 'd1', 'x', 100, 5)),  # 事件到期 15，seen 到期 110
+            (20, ('pop_live_batch',)),
+            (20, ('push', 'd1', 'again', 100)),           # 槽位空了但去重优先拦截
+            (20, ('push', 'd2', 'new', 100)),             # 其他去重键可占释放槽位
+        ])
+        self.assertEqual([d.event for d in results[1].discarded], ['x'])
+        self.assertEqual(results[2].reason, 'dedupe_window')
+        self.assertTrue(results[3].accepted)
+
+    def test_same_timestamp_records_share_boundary(self):
+        # 同一时刻写入 ttl=0 后立即 get：到期点 == 记录时刻 => None 并移除
+        results = self.cache.replay_batch([
+            (10, ('put', 'a', 'v', 0)),
+            (10, ('get', 'a')),
+            (10, ('get', 'a')),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertEqual(results[1:], [None, None])
+        # 同一时刻两条 peek_live 看到相同结果，且不影响后续 pop_live
+        self.cache.replay_batch([(10, ('push_expiring', 'd', 'e', 10, 0))])
+        peek_results = self.cache.replay_batch([
+            (10, ('peek_live_batch',)),
+            (10, ('peek_live_batch',)),
+        ])
+        self.assertEqual([[d.event for d in r.discarded] for r in peek_results],
+                         [['e'], ['e']])
+        pop_results = self.cache.replay_batch([(10, ('pop_live_batch',))])
+        self.assertEqual([d.event for d in pop_results[0].discarded], ['e'])
+
+    # ---- 读写交错：读取结果可被后续记录继续消费 ----
+    def test_mixed_sequence_reconstructs_queue_state(self):
+        # 空队列起步，仅靠一批记录重建完整处理序列
+        results = self.cache.replay_batch([
+            (0, ('put', 'k', 'v', 10)),        # 到期 10
+            (0, ('push_expiring', 'd1', 'x', 100, 5)),  # 事件到期 5
+            (0, ('push', 'd2', 'a', 100)),
+            (4, ('peek', 2)),                   # [x, a]
+            (5, ('pop_live_batch', 1)),         # x 过期丢弃；a 有效即停
+            (5, ('queue_status',)),             # size 0（两项均被扫描移除）
+            (5, ('push', 'd3', 'b', 100)),      # 槽位已释放：接受
+            (10, ('get', 'k')),                 # 边界过期：None 并移除
+            (10, ('pop',)),                     # b
+            (10, ('pop',)),                     # None
+        ])
+        self.assertEqual(results[3], ['x', 'a'])
+        self.assertEqual([d.event for d in results[4].discarded], ['x'])
+        self.assertEqual(results[4].events, ['a'])
+        self.assertEqual(results[5].size, 0)
+        self.assertTrue(results[6].accepted)
+        self.assertIsNone(results[7])
+        self.assertEqual(results[8:], ['b', None])
+        self.assertEqual(self.cache.values, {})
+        self.assertEqual(self.cache.queue_status().size, 0)
+
+    # ---- 与公开入口在相同时间序列下的等价性 ----
+    def _normalize(self, value):
+        if isinstance(value, Result):
+            return {k: self._normalize(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._normalize(v) for v in value]
+        return value
+
+    _READ_TAGS = frozenset(
+        ('get', 'pop', 'pop_batch', 'peek', 'pop_live_batch', 'peek_live_batch', 'queue_status'))
+
+    def _public_invoke(self, cache, now_value, op):
+        tag = op[0]
+        if tag == 'put':
+            return cache.put(op[1], op[2], op[3])
+        if tag == 'delete':
+            return cache.delete(op[1])
+        if tag == 'push':
+            return cache.push(op[1], op[2], op[3])
+        if tag == 'push_expiring':
+            return cache.push_expiring(op[1], op[2], op[3], op[4])
+        if tag == 'cleanup':
+            return cache.cleanup()
+        if tag == 'cleanup_expired_events':
+            return cache.cleanup_expired_events()
+        if tag == 'get':
+            return cache.get(op[1])
+        if tag == 'pop':
+            return cache.pop()
+        if tag == 'pop_batch':
+            return cache.pop_batch(op[1] if len(op) > 1 else None)
+        if tag == 'peek':
+            return cache.peek(op[1] if len(op) > 1 else None)
+        if tag == 'pop_live_batch':
+            return cache.pop_live_batch(op[1] if len(op) > 1 else None)
+        if tag == 'peek_live_batch':
+            return cache.peek_live_batch(op[1] if len(op) > 1 else None)
+        if tag == 'queue_status':
+            return cache.queue_status()
+        raise AssertionError(tag)
+
+    def assert_replay_matches_public(self, records, max_queue=None):
+        ref = EventCache(lambda: self.now[0], max_queue=max_queue)
+        replay = EventCache(self.clock, max_queue=max_queue)
+        reference_results = []
+        for ts, op in records:
+            self.now[0] = ts
+            reference_results.append(self._public_invoke(ref, ts, op))
+        replay_results = replay.replay_batch(records)
+        self.assertEqual(self.clock_calls[0], 0)  # 回放全程不读注入时钟
+        self.assertEqual(len(replay_results), len(records))
+        # 写入类公开入口的返回形状（None/bool）与回放 Result 本就不同，只逐行比对
+        # 读取类记录；整体终态由末尾快照相等保证
+        for op, got, expected in zip(
+                [o for _, o in records], replay_results, reference_results):
+            if op[0] in self._READ_TAGS:
+                self.assertEqual(self._normalize(got), self._normalize(expected))
+        self.assertEqual(replay.snapshot(), ref.snapshot())  # 终态（含事件到期信息）一致
+
+    def test_equivalence_mixed_read_write_scenario(self):
+        records = [
+            (100, ('put', 'a', 1, 20)),
+            (100, ('put', 'n', None, 50)),
+            (100, ('push_expiring', 'd1', 'x1', 100, 5)),
+            (100, ('push', 'd2', 'm', 100)),
+            (100, ('push_expiring', 'd3', 'x2', 100, 50)),
+            (102, ('get', 'a')),
+            (102, ('get', 'missing')),
+            (102, ('peek',)),
+            (103, ('peek_live_batch', 1)),
+            (105, ('peek_live_batch', 2)),
+            (105, ('queue_status',)),
+            (105, ('pop_live_batch', 1)),
+            (105, ('queue_status',)),
+            (105, ('get', 'a')),
+            (120, ('get', 'a')),
+            (120, ('get', 'n')),
+            (120, ('pop',)),
+            (120, ('pop',)),
+            (120, ('pop_batch', 5)),
+            (120, ('queue_status',)),
+            (120, ('pop_live_batch',)),
+            (130, ('push', 'd4', 'e4', 10)),
+            (130, ('peek', 0)),
+            (130, ('pop_live_batch', 0)),
+            (130, ('pop_batch',)),
+            (150, ('get', 'n')),
+            (150, ('cleanup',)),
+        ]
+        self.assert_replay_matches_public(records)
+
+    def test_equivalence_capacity_limits_and_discards(self):
+        records = [
+            (10, ('push_expiring', 'd1', 'x1', 100, 1)),
+            (10, ('push', 'd2', 'a', 100)),
+            (11, ('push', 'd3', 'b', 10)),
+            (20, ('pop_live_batch', 1)),
+            (20, ('queue_status',)),
+            (20, ('push', 'd3', 'b', 10)),
+            (20, ('push', 'd1', 'dup', 100)),
+            (30, ('peek',)),
+            (30, ('peek_live_batch', 99)),
+            (110, ('pop',)),
+            (110, ('push', 'd1', 'again', 10)),
+            (110, ('pop_batch',)),
+            (110, ('queue_status',)),
+        ]
+        self.assert_replay_matches_public(records, max_queue=2)
+
+    def test_equivalence_plain_and_expired_mix_with_large_limit(self):
+        records = [
+            (0, ('push_expiring', 'd1', 'x1', 100, 1)),
+            (0, ('push', 'd2', 'a', 100)),
+            (0, ('push_expiring', 'd3', 'x2', 100, 1)),
+            (0, ('push', 'd4', 'b', 100)),
+            (0, ('push_expiring', 'd5', 'x3', 100, 1)),
+            (10, ('peek_live_batch', 100)),
+            (10, ('pop_live_batch', 100)),
+            (10, ('peek',)),
+            (10, ('queue_status',)),
+        ]
+        self.assert_replay_matches_public(records)
+
+    # ---- 校验：结构、标签、limit、时间、原子性 ----
+    def assert_rejected(self, records, exc_type):
+        # 每次断言使用全新缓存：同一 cache 上重复 seed 会被去重窗口拦截
+        cache = EventCache(self.clock)
+        cache.replay_batch([
+            (100, ('put', 'a', 'v', 5)),
+            (100, ('put', 'n', None, 100)),
+            (100, ('push_expiring', 'd1', 'x1', 100, 5)),
+            (100, ('push', 'd2', 'm', 100)),
+            (100, ('push_expiring', 'd3', 'x2', 100, 50)),
+        ])
+        before = (dict(cache.values), list(cache.events),
+                  list(cache.event_expiries), dict(cache.seen))
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(exc_type):
+            cache.replay_batch(records)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        after = (dict(cache.values), list(cache.events),
+                 list(cache.event_expiries), dict(cache.seen))
+        self.assertEqual(before, after)
+
+    def test_unknown_or_misshapen_read_ops_raise_value_error(self):
+        for bad in (
+            [(1, ('get',))],
+            [(1, ('get', 'k', 'extra'))],
+            [(1, ('pop', 'x'))],
+            [(1, ('pop_batch', 1, 2))],
+            [(1, ('peek', 1, 2))],
+            [(1, ('pop_live_batch', 1, 2))],
+            [(1, ('peek_live_batch', 1, 2))],
+            [(1, ('queue_status', 'x'))],
+            [(1, ('not_a_read',))],
+            [(1, 'get')],               # 操作不是元组
+        ):
+            self.assert_rejected(bad, ValueError)
+
+    def test_read_tags_are_not_accepted_by_apply_batch(self):
+        for op in (
+            ('get', 'k'), ('pop',), ('pop_batch',), ('peek',),
+            ('pop_live_batch',), ('peek_live_batch',), ('queue_status',),
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.apply_batch([op])
+
+    def test_bad_limit_raises_value_error_atomically(self):
+        # 即使首条记录本会惰性删除过期键，校验失败也必须整批不动
+        self.seed()
+        for bad_limit in (-1, -10, 1.5, 2.0, True, False, '3', [3], object()):
+            for tag in ('pop_batch', 'peek', 'pop_live_batch', 'peek_live_batch'):
+                with self.assertRaises(ValueError):
+                    self.cache.replay_batch([
+                        (105, ('get', 'a')),
+                        (105, (tag, bad_limit)),
+                    ])
+            # 首条 get 的惰性删除同样不得生效
+            self.assertIn('a', self.cache.values)
+            self.assertEqual(self.cache.queue_status().size, 3)
+
+    def test_explicit_none_limit_is_accepted(self):
+        self.seed()
+        results = self.cache.replay_batch([
+            (0, ('pop_batch', None)),
+            (0, ('peek', None)),
+            (0, ('pop_live_batch', None)),
+        ])
+        self.assertEqual(results[0], ['x1', 'm', 'x2'])
+        self.assertEqual(results[1], [])
+        self.assertEqual(results[2], Result(events=[], discarded=[]))
+
+    def test_timestamp_validation_still_applies_with_reads(self):
+        self.assert_rejected(
+            [(10, ('pop',)), (9, ('pop',))], ValueError)  # 时间倒退
+        for bad_ts in (True, float('nan'), float('inf'), '10'):
+            self.assert_rejected([(bad_ts, ('queue_status',))], ValueError)
+
+    def test_record_pair_structure_still_enforced(self):
+        for bad in ([('get', 'k')], [(1, ('pop',), 2)], [('ab',)]):
+            self.assert_rejected(bad, ValueError)
+
+    def test_validation_error_priority_follows_record_order(self):
+        # 先时间倒退（ValueError）优先于后项不可哈希 key（TypeError）
+        self.assert_rejected(
+            [(10, ('pop',)), (5, ('get', ['k']))], ValueError)
+        # 先不可哈希 key（TypeError）优先于后项的坏 limit（ValueError）
+        self.assert_rejected(
+            [(1, ('get', ['k'])), (2, ('pop_batch', -1))], TypeError)
+        # 先坏 limit（ValueError）优先于后项时间倒退
+        self.assert_rejected(
+            [(1, ('peek', -1)), (0, ('pop',))], ValueError)
+
+
 if __name__ == '__main__':
     unittest.main()

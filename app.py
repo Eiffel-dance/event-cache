@@ -66,6 +66,15 @@ def _check_max_queue(value):
         raise ValueError('max_queue must be None or a non-negative integer')
 
 
+def _check_limit(value):
+    """pop_batch/peek/pop_live_batch/peek_live_batch 的 limit 必须是 None
+    或非 bool 的非负整数，布尔值（int 子类）与浮点数（含 2.0）同样拒绝。"""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError('limit must be None or a non-negative integer')
+
+
 def _parse_batch(batch):
     """在读取时钟或改变任何状态前完整解析并校验批次。
 
@@ -100,16 +109,21 @@ def _parse_batch(batch):
     return entries
 
 
-def _parse_operation(item, allow_event_cleanup=False):
+def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     """解析并物化单条带标签操作（apply_batch 与 replay_batch 共用）。
 
     操作必须是带标签的元组：('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
     ('push_expiring', dedupe, event, window, event_ttl) 或 ('cleanup',)；
-    allow_event_cleanup 为真时额外接受 ('cleanup_expired_events',)。
-    条目不是元组、标签未知、元组长度不符或 ttl/window/event_ttl 非法时
-    统一抛出 ValueError；key/dedupe 不可哈希、无法作为缓存索引时抛出
-    TypeError。返回物化后的操作元组。
+    allow_event_cleanup 为真时额外接受 ('cleanup_expired_events',)；
+    allow_reads 为真时（仅回放）额外接受读取与出队路径：
+    ('get', key)、('pop',)、('pop_batch',)、('pop_batch', limit)、
+    ('peek',)、('peek', limit)、('pop_live_batch',)、
+    ('pop_live_batch', limit)、('peek_live_batch',)、
+    ('peek_live_batch', limit) 与 ('queue_status',)。
+    条目不是元组、标签未知、元组长度不符或 ttl/window/event_ttl/limit
+    非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为缓存索引时
+    抛出 TypeError。返回物化后的操作元组（缺省 limit 物化为 None）。
     """
     if not isinstance(item, tuple) or len(item) == 0:
         raise ValueError('each operation must be a tagged tuple')
@@ -152,6 +166,30 @@ def _parse_operation(item, allow_event_cleanup=False):
             raise ValueError(
                 "'cleanup_expired_events' operation must be ('cleanup_expired_events',)")
         return ('cleanup_expired_events',)
+    if allow_reads:
+        if tag == 'get':
+            if len(item) != 2:
+                raise ValueError("'get' operation must be ('get', key)")
+            _, key = item
+            hash(key)
+            return ('get', key)
+        if tag == 'pop':
+            if len(item) != 1:
+                raise ValueError("'pop' operation must be ('pop',)")
+            return ('pop',)
+        if tag in ('pop_batch', 'peek', 'pop_live_batch', 'peek_live_batch'):
+            if len(item) == 1:
+                return (tag, None)
+            if len(item) == 2:
+                _, limit = item
+                _check_limit(limit)
+                return (tag, limit)
+            raise ValueError(
+                "'%s' operation must be ('%s',) or ('%s', limit)" % (tag, tag, tag))
+        if tag == 'queue_status':
+            if len(item) != 1:
+                raise ValueError("'queue_status' operation must be ('queue_status',)")
+            return ('queue_status',)
     raise ValueError('unknown operation tag: %r' % (tag,))
 
 
@@ -178,12 +216,16 @@ def _parse_replay_batch(records):
 
     records 必须可迭代，每项为 (timestamp, operation) 二元结构：timestamp
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
-    边界，时间倒退抛出 ValueError）；operation 为带标签元组，标签与结构
-    沿用 _parse_apply_batch 的 put/delete/push/push_expiring/cleanup，
-    并额外接受 ('cleanup_expired_events',)。records 不可迭代、记录不是
-    二元结构、时间戳非法或倒退、操作结构/标签/参数数量/时长非法时统一
-    抛出 ValueError；key/dedupe 不可哈希时原样抛出 TypeError。返回物化
-    后的 (timestamp, operation) 列表，供调用方按各自记录时刻顺序回放。
+    边界，时间倒退抛出 ValueError）；operation 为带标签元组，写入与清理
+    标签沿用 _parse_apply_batch 的 put/delete/push/push_expiring/cleanup，
+    并额外接受 ('cleanup_expired_events',)；读取与出队标签 ('get', key)、
+    ('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
+    ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
+    ('queue_status',) 也只在回放中接受，其 limit 必须是 None 或非 bool 的
+    非负整数。records 不可迭代、记录不是二元结构、时间戳非法或倒退、操作
+    结构/标签/参数数量/时长/limit 非法时统一抛出 ValueError；key/dedupe
+    不可哈希时原样抛出 TypeError。返回物化后的 (timestamp, operation)
+    列表（读取类缺省 limit 物化为 None），供调用方按各自记录时刻顺序回放。
     """
     try:
         iterator = iter(records)
@@ -204,7 +246,8 @@ def _parse_replay_batch(records):
         if previous is not None and timestamp < previous:
             raise ValueError('timestamps must be in non-decreasing order')
         previous = timestamp
-        parsed.append((timestamp, _parse_operation(operation, allow_event_cleanup=True)))
+        parsed.append((timestamp, _parse_operation(
+            operation, allow_event_cleanup=True, allow_reads=True)))
     return parsed
 
 
@@ -292,17 +335,25 @@ class EventCache:
         now = self.clock()
         self._put_at(key, value, ttl, now)
 
-    def get(self, key):
+    def _get_at(self, key, now):
+        # 在指定时刻读取键值：键不存在或到期点 <= now 时返回 None；
+        # 后者顺带移除该键，语义与公开 get 完全一致
         item = self.values.get(key)
         if item is None:
             return None
         value, expiry = item
-        now = self.clock()
-        # 到期点小于或等于当前时刻即视为过期
         if expiry <= now:
             self.values.pop(key, None)
             return None
         return value
+
+    def get(self, key):
+        # 保持既有时间约定：键不存在（或不可哈希直接抛 TypeError）时不读取时钟；
+        # 仅当键存在时才读取一次时钟并按到期边界判定
+        if key not in self.values:
+            return None
+        now = self.clock()
+        return self._get_at(key, now)
 
     def delete(self, key):
         # 结果只表达键是否存在，与取出的值无关：value 为 None、False、0、''
@@ -453,21 +504,38 @@ class EventCache:
         """按记录自带的逻辑时间戳确定性回放一批操作。
 
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
-        int/float 且按非递减顺序出现；operation 沿用 apply_batch 的
-        put/delete/push/push_expiring/cleanup 语义，并额外接受
-        ('cleanup_expired_events',)。每条记录以自己的 timestamp 作为当前
-        时刻计算 TTL、event_ttl 与去重窗口的绝对边界，同一时间戳共享该
+        int/float 且按非递减顺序出现；写入与清理 operation 沿用
+        apply_batch 的 put/delete/push/push_expiring/cleanup 语义，并额外
+        接受 ('cleanup_expired_events',)；读取与出队路径同样可回放：
+        ('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
+        ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
+        ('queue_status',)。每条记录以自己的 timestamp 作为当前时刻计算
+        TTL、event_ttl 与去重窗口的绝对边界，同一时间戳按输入顺序共享该
         边界；回放全程不读取注入时钟、不启动后台线程，记录时间的推进本身
-        不触发 values/seen/事件的任何自动清理。先完整校验全部记录再改动
-        状态：任一记录非法时整批拒绝，缓存保持原样。空记录返回空列表且不
-        读取时钟。成功时返回与输入逐项对应的 Result 列表：put 为
-        accepted/reason，push 类仅 accepted 与 reason
-        （None/dedupe_window/queue_full），delete 为 deleted，cleanup 为
-        values_removed/dedupe_removed，cleanup_expired_events 为
-        events_removed。回放写入的绝对到期时间与常规路径一致，可由
-        snapshot 保存并由 restore 恢复。
+        不触发 values/seen/事件的任何自动清理。
+
+        读取类记录的结果形状与对应公开入口逐项一致：get 原样返回值或 None，
+        键到期点 <= 记录时刻时返回 None 并移除该键；pop 原样返回队头事件或
+        None；pop_batch/peek 返回普通 list；pop_live_batch/peek_live_batch
+        返回 Result(events, discarded)，discarded 每项为
+        Result(event=原事件值, reason='event_ttl')；queue_status 返回
+        Result(size, max_queue)。pop 与 pop_batch 不按时间判 TTL，过期事件
+        一样原样出队；pop_live_batch 移除已扫描项（过期项进 discarded、有效
+        项按 limit 交付够数即停止），peek/peek_live_batch/queue_status 不改
+        变队列，peek 报告的过期项不释放槽位，未扫描尾项一律保持原状。读取
+        记录造成的状态变化（惰性删键、出队、丢弃过期事件）可被后续记录继续
+        消费。limit 为 0 的 live 记录不扫描即返回两个空列表。
+
+        先完整校验全部记录再改动状态：记录不是二元组、标签或参数不支持、
+        时间不是有限数、时间倒退、limit 不是 None 或非 bool 非负整数时整批
+        以 ValueError 拒绝，缓存保持原样；键或去重键不可哈希时原样传播
+        TypeError。空记录返回空列表且不读取时钟。成功时返回与输入严格逐项
+        对应的结果列表（写入类为 accepted/reason，delete 为 deleted，
+        cleanup 为 values_removed/dedupe_removed，
+        cleanup_expired_events 为 events_removed，读取类如上）。回放写入的
+        绝对到期时间与常规路径一致，可由 snapshot 保存并由 restore 恢复。
         """
-        # 先完整校验记录结构、时间戳单调性、操作与键：在此之前不读取时钟、不改变任何状态
+        # 先完整校验记录结构、时间戳单调性、操作、limit 与键：在此之前不读取时钟、不改变任何状态
         parsed = _parse_replay_batch(records)
         results = []
         for now, op in parsed:
@@ -495,8 +563,32 @@ class EventCache:
                     values_removed=values_removed,
                     dedupe_removed=dedupe_removed,
                 ))
-            else:  # 'cleanup_expired_events'
+            elif tag == 'cleanup_expired_events':
                 results.append(Result(events_removed=self._cleanup_events_at(now)))
+            elif tag == 'get':
+                _, key = op
+                # 以记录时刻判定 TTL：到期点 <= 记录时刻即返回 None 并移除该键
+                results.append(self._get_at(key, now))
+            elif tag == 'pop':
+                # 与公开 pop 一致：不读取时间，过期事件原样返回
+                results.append(self.pop())
+            elif tag == 'pop_batch':
+                _, limit = op
+                results.append(self.pop_batch(limit))
+            elif tag == 'peek':
+                _, limit = op
+                results.append(self.peek(limit))
+            elif tag in ('pop_live_batch', 'peek_live_batch'):
+                _, limit = op
+                if limit == 0:
+                    # 与公开入口一致：零配额不扫描、不出队、不判 TTL
+                    results.append(Result(events=[], discarded=[]))
+                elif tag == 'pop_live_batch':
+                    results.append(self._pop_live_batch_at(limit, now))
+                else:
+                    results.append(self._peek_live_batch_at(limit, now))
+            else:  # 'queue_status'
+                results.append(self.queue_status())
         return results
 
     def pop(self):
@@ -514,12 +606,10 @@ class EventCache:
         队列容量位置。limit 为负数、浮点数、字符串、布尔值或其他非整数时
         抛出 ValueError，且不移除任何事件。
         """
+        _check_limit(limit)
         if limit is None:
             count = len(self.events)
         else:
-            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
-            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
-                raise ValueError('limit must be None or a non-negative integer')
             count = min(limit, len(self.events))
         # 逐个 popleft 与连续调用 pop 的顺序和元素完全一致，事件为 None 也原样保留
         taken = []
@@ -538,15 +628,50 @@ class EventCache:
         时钟。limit 为负数、浮点数、字符串、布尔值或其他非整数时抛出
         ValueError，抛出前不改变任何状态。
         """
+        _check_limit(limit)
         if limit is None:
             count = len(self.events)
         else:
-            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
-            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
-                raise ValueError('limit must be None or a non-negative integer')
             count = min(limit, len(self.events))
         # 只物化队头前缀副本，deque 本身保持不变
         return [self.events[i] for i in range(count)]
+
+    def _pop_live_batch_at(self, limit, now):
+        """pop_live_batch 的时间驱动内核：limit 已由调用方校验，按 FIFO 从
+        队头扫描并实际出列。供公开入口（注入时钟）与 replay_batch（记录时间）
+        共用，保证两条路径的扫描顺序、discarded 形状与 limit 停止条件完全一致。
+        limit 为 0 或队列为空时扫描循环自然产出两个空列表。"""
+        events = []
+        discarded = []
+        # 从队头逐项判定：有效事件与过期事件都已出列，停止扫描后剩余元素
+        # 自然保持原序留在 deque 中，槽位不被提前释放
+        while self.events:
+            event = self.events.popleft()
+            expiry = self.event_expiries.popleft()
+            if expiry is not None and expiry <= now:
+                # 到期边界与 values/seen/cleanup_expired_events 一致：<= 即过期
+                discarded.append(Result(event=event, reason='event_ttl'))
+            else:
+                events.append(event)
+                if limit is not None and len(events) >= limit:
+                    break
+        return Result(events=events, discarded=discarded)
+
+    def _peek_live_batch_at(self, limit, now):
+        """peek_live_batch 的时间驱动内核：同样的 TTL 判定与边界，但只读扫描、
+        不出队。limit 已由调用方校验；为 0 或队列为空时自然产出两个空列表。"""
+        events = []
+        discarded = []
+        # 只读扫描：索引遍历而不 popleft，队列与 event_expiries 原样保留
+        for event, expiry in zip(self.events, self.event_expiries):
+            if expiry is not None and expiry <= now:
+                # 到期边界与 pop_live_batch 一致：<= 即过期
+                discarded.append(Result(event=event, reason='event_ttl'))
+            else:
+                events.append(event)
+                if limit is not None and len(events) >= limit:
+                    break
+        return Result(events=events, discarded=discarded)
 
     def pop_live_batch(self, limit=None):
         """过期感知的批量出队：一次时钟判断同时给出有效事件与被丢弃事件。
@@ -569,32 +694,15 @@ class EventCache:
         抛出的异常原样传播。返回 Result(events=有效事件列表,
         discarded=丢弃结果列表)，两者均为普通 list。
         """
-        if limit is not None:
-            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
-            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
-                raise ValueError('limit must be None or a non-negative integer')
-            if limit == 0:
-                # 显式零配额：不读时钟、不扫描、不改状态
-                return Result(events=[], discarded=[])
+        _check_limit(limit)
+        if limit == 0:
+            # 显式零配额：不读时钟、不扫描、不改状态（None == 0 为 False，不误伤缺省）
+            return Result(events=[], discarded=[])
         if not self.events:
             # 空队列不读取时钟
             return Result(events=[], discarded=[])
         now = self.clock()
-        events = []
-        discarded = []
-        # 从队头逐项判定：有效事件与过期事件都已出列，停止扫描后剩余元素
-        # 自然保持原序留在 deque 中，槽位不被提前释放
-        while self.events:
-            event = self.events.popleft()
-            expiry = self.event_expiries.popleft()
-            if expiry is not None and expiry <= now:
-                # 到期边界与 values/seen/cleanup_expired_events 一致：<= 即过期
-                discarded.append(Result(event=event, reason='event_ttl'))
-            else:
-                events.append(event)
-                if limit is not None and len(events) >= limit:
-                    break
-        return Result(events=events, discarded=discarded)
+        return self._pop_live_batch_at(limit, now)
 
     def peek_live_batch(self, limit=None):
         """非破坏性地预览 pop_live_batch：同样的 TTL 判定与边界，但不移除事件。
@@ -616,29 +724,15 @@ class EventCache:
         返回 Result(events=有效事件列表, discarded=丢弃结果列表)，两者均为
         普通 list。
         """
-        if limit is not None:
-            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
-            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
-                raise ValueError('limit must be None or a non-negative integer')
-            if limit == 0:
-                # 显式零配额：不读时钟、不扫描、不改状态
-                return Result(events=[], discarded=[])
+        _check_limit(limit)
+        if limit == 0:
+            # 显式零配额：不读时钟、不扫描、不改状态（None == 0 为 False，不误伤缺省）
+            return Result(events=[], discarded=[])
         if not self.events:
             # 空队列不读取时钟
             return Result(events=[], discarded=[])
         now = self.clock()
-        events = []
-        discarded = []
-        # 只读扫描：索引遍历而不 popleft，队列与 event_expiries 原样保留
-        for event, expiry in zip(self.events, self.event_expiries):
-            if expiry is not None and expiry <= now:
-                # 到期边界与 pop_live_batch 一致：<= 即过期
-                discarded.append(Result(event=event, reason='event_ttl'))
-            else:
-                events.append(event)
-                if limit is not None and len(events) >= limit:
-                    break
-        return Result(events=events, discarded=discarded)
+        return self._peek_live_batch_at(limit, now)
 
     def queue_status(self):
         # 纯查询：不读取时钟、不触发清理、不改变队列
