@@ -114,9 +114,9 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
 
     操作必须是带标签的元组：('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
-    ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',) 或
-    ('cleanup_all_expired',)；allow_event_cleanup 为真时额外接受
-    ('cleanup_expired_events',)；
+    ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)、
+    ('cleanup_all_expired',) 或 ('discard_expired_events',)；
+    allow_event_cleanup 为真时额外接受 ('cleanup_expired_events',)；
     allow_reads 为真时再接受读取与出队路径的记录：('get', key)、
     ('pop',)、('pop_batch',)、('pop_batch', limit)、('peek',)、
     ('peek', limit)、('pop_live_batch',)、('pop_live_batch', limit)、
@@ -167,6 +167,11 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
             raise ValueError(
                 "'cleanup_all_expired' operation must be ('cleanup_all_expired',)")
         return ('cleanup_all_expired',)
+    if tag == 'discard_expired_events':
+        if len(item) != 1:
+            raise ValueError(
+                "'discard_expired_events' operation must be ('discard_expired_events',)")
+        return ('discard_expired_events',)
     if tag == 'cleanup_expired_events' and allow_event_cleanup:
         if len(item) != 1:
             raise ValueError(
@@ -206,8 +211,8 @@ def _parse_apply_batch(batch):
     批次必须可迭代，每项为带标签的元组：
     ('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
-    ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',) 或
-    ('cleanup_all_expired',)。
+    ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)、
+    ('cleanup_all_expired',) 或 ('discard_expired_events',)。
     批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window/
     event_ttl 非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为
     缓存索引时抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
@@ -226,7 +231,8 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/delete/push/push_expiring/cleanup/
-    cleanup_all_expired 与 ('cleanup_expired_events',) 外，还接受读取与出队路径的
+    cleanup_all_expired/discard_expired_events 与 ('cleanup_expired_events',)
+    外，还接受读取与出队路径的
     ('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
     ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数。
@@ -417,6 +423,46 @@ class EventCache:
         now = self.clock()
         return Result(events_removed=self._cleanup_events_at(now))
 
+    def _discard_events_at(self, now):
+        # 在指定观察时刻审计整条队列并产出丢弃明细：与 _cleanup_events_at
+        # 使用同一到期边界（expiry is not None 且 expiry <= now）和同样的
+        # FIFO 重排，但额外按扫描顺序保留每个被删除事件的原引用，值为 None
+        # 时也照样记录。values、seen、max_queue 与去重窗口一律不触碰，删除
+        # 立即释放队列槽位（events 与 event_expiries 同步缩短）。
+        kept_events = deque()
+        kept_expiries = deque()
+        discarded = []
+        for event, expiry in zip(self.events, self.event_expiries):
+            if expiry is not None and expiry <= now:
+                discarded.append(Result(event=event, reason='event_ttl'))
+            else:
+                kept_events.append(event)
+                kept_expiries.append(expiry)
+        self.events = kept_events
+        self.event_expiries = kept_expiries
+        return Result(events_removed=len(discarded), discarded=discarded)
+
+    def discard_expired_events(self):
+        """单次读取时钟，审计并清理队列中所有已到期的带 TTL 事件。
+
+        按当前 FIFO 顺序扫描整个队列：仅移除设置了 event_ttl 且绝对到期点
+        <= 本次观察时刻的项目；未设置事件 TTL 或尚未到期（到期点大于观察
+        时刻）的项目一律保留，剩余事件保持原相对顺序，被移除项目立即释放
+        队列容量。到期点恰好等于观察时刻时视为过期，边界与
+        cleanup_expired_events/pop_live_batch 一致。
+
+        调用时无论队列是否为空都从注入时间源读取一次观察时刻；时间源抛出
+        的异常原样传播，队列、到期对齐信息与其他缓存状态保持不变。清理不
+        读取或改变 values、seen、max_queue，也不延长或删除任何去重窗口。
+
+        返回 Result(events_removed=移除数量, discarded=丢弃明细列表)，
+        discarded 中每个元素为 Result(event=原事件值, reason='event_ttl')，
+        顺序与被删除事件在原队列中的顺序一致，事件值为 None 时也保留该条
+        记录。重复调用在没有新的到期事件时返回零计数与空列表。
+        """
+        now = self.clock()
+        return self._discard_events_at(now)
+
     def _cleanup_all_at(self, now):
         # 在指定时刻一次性清理全部过期状态：值记录、去重记录与带 TTL 事件
         # 共用同一判定时刻与 <= 边界；三类清理互不干扰（清事件不动 seen，
@@ -532,6 +578,9 @@ class EventCache:
                         values_removed=values_removed,
                         dedupe_removed=dedupe_removed,
                     ))
+                elif tag == 'discard_expired_events':
+                    # 与整批共享同一时钟读数，按操作顺序影响后续操作
+                    results.append(self._discard_events_at(now))
                 else:  # 'cleanup_all_expired'
                     # 与整批共享同一时钟读数，按操作顺序影响后续操作
                     values_removed, dedupe_removed, events_removed = \
@@ -548,8 +597,9 @@ class EventCache:
 
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
-        put/delete/push/push_expiring/cleanup/cleanup_all_expired 与
-        ('cleanup_expired_events',) 外，还可表达读取与出队路径：
+        put/delete/push/push_expiring/cleanup/cleanup_all_expired/
+        discard_expired_events 与 ('cleanup_expired_events',) 外，还可表达
+        读取与出队路径：
         ('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
         ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
         ('queue_status',)。每条记录以自己的 timestamp 作为当前时刻计算
@@ -579,7 +629,8 @@ class EventCache:
         对应、形状与各公开操作一致的结果列表：put 为 accepted/reason，
         push 类仅 accepted 与 reason（None/dedupe_window/queue_full），
         delete 为 deleted，cleanup 为 values_removed/dedupe_removed，
-        cleanup_expired_events 为 events_removed，cleanup_all_expired 为
+        cleanup_expired_events 为 events_removed，discard_expired_events 为
+        events_removed/discarded，cleanup_all_expired 为
         values_removed/dedupe_removed/events_removed，get/pop 为单个值，
         pop_batch/peek 为普通 list，pop_live_batch/peek_live_batch 为含
         events/discarded 两个 list 的 Result，queue_status 为含
@@ -616,6 +667,9 @@ class EventCache:
                 ))
             elif tag == 'cleanup_expired_events':
                 results.append(Result(events_removed=self._cleanup_events_at(now)))
+            elif tag == 'discard_expired_events':
+                # 以记录自带时刻为观察点，不读取注入时钟
+                results.append(self._discard_events_at(now))
             elif tag == 'cleanup_all_expired':
                 # 以记录自带时刻为观察点，不读取注入时钟
                 values_removed, dedupe_removed, events_removed = \
