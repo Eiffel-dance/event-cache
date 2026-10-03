@@ -1777,5 +1777,253 @@ class ExpiringSnapshotTest(unittest.TestCase):
         self.assertEqual(list(cache.event_expiries), [None, 150, 2.5])
 
 
+class ReplayBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    # ---- 基本语义：记录时刻即当前时刻 ----
+    def test_empty_records_returns_empty_without_clock(self):
+        self.assertEqual(self.cache.replay_batch([]), [])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_replay_never_reads_injected_clock(self):
+        results = self.cache.replay_batch([
+            (10, ('put', 'a', 'v', 5)),
+            (20, ('push', 'd1', 'e1', 10)),
+            (25, ('push_expiring', 'd2', 'e2', 10, 5)),
+            (30, ('cleanup',)),
+            (30, ('cleanup_expired_events',)),
+            (40, ('delete', 'a')),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual([set(r) for r in results], [
+            {'accepted', 'reason'},
+            {'accepted', 'reason'},
+            {'accepted', 'reason'},
+            {'values_removed', 'dedupe_removed'},
+            {'events_removed'},
+            {'deleted'},
+        ])
+
+    def test_put_uses_record_timestamp_for_expiry(self):
+        self.cache.replay_batch([(10, ('put', 'a', 'v', 5))])
+        self.assertEqual(self.cache.values['a'], ('v', 15))
+        # 记录时间不推进注入时钟：按当前时钟 100 判定已到期
+        self.assertIsNone(self.cache.get('a'))
+
+    def test_delete_result_matches_single_delete(self):
+        self.cache.replay_batch([(10, ('put', 'n', None, 100))])
+        results = self.cache.replay_batch([(20, ('delete', 'n')), (20, ('delete', 'n'))])
+        self.assertEqual([r.deleted for r in results], [True, False])
+        self.assertNotIn('n', self.cache.values)
+
+    def test_push_results_only_accepted_and_reason(self):
+        results = self.cache.replay_batch([
+            (10, ('push', 'd', 'e1', 10)),
+            (15, ('push', 'd', 'e2', 10)),   # 窗口 10+10=20 > 15：去重拒绝
+            (20, ('push', 'd', 'e3', 10)),   # 到期点 <= 记录时刻：可重入
+        ])
+        self.assertEqual([(r.accepted, r.reason) for r in results], [
+            (True, None), (False, 'dedupe_window'), (True, None),
+        ])
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e3'])
+
+    def test_same_timestamp_shares_boundary(self):
+        results = self.cache.replay_batch([
+            (10, ('push', 'd', 'e1', 0)),   # window=0：到期点 == 记录时刻
+            (10, ('push', 'd', 'e2', 0)),   # 同一时刻按 <= 边界可重入
+        ])
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2'])
+
+    def test_push_expiring_records_absolute_expiry_from_record_time(self):
+        self.cache.replay_batch([(10, ('push_expiring', 'd', 'e', 10, 5))])
+        self.assertEqual(list(self.cache.event_expiries), [15])
+
+    def test_queue_full_rejection_uses_record_moment_state(self):
+        cache = self.make(1)
+        results = cache.replay_batch([
+            (10, ('push', 'd1', 'e1', 10)),
+            (11, ('push', 'd2', 'e2', 10)),
+        ])
+        self.assertEqual([(r.accepted, r.reason) for r in results], [
+            (True, None), (False, 'queue_full'),
+        ])
+        self.assertNotIn('d2', cache.seen)
+
+    def test_time_advance_does_not_auto_cleanup(self):
+        # 记录时刻前进本身不清理 values/seen/事件；需显式 cleanup 操作
+        self.cache.replay_batch([
+            (10, ('put', 'a', 'v', 5)),
+            (10, ('push_expiring', 'd', 'e', 5, 5)),
+            (100, ('push', 'd2', 'e2', 5)),
+        ])
+        self.assertIn('a', self.cache.values)
+        self.assertIn('d', self.cache.seen)
+        self.assertEqual(self.cache.queue_status().size, 2)
+        results = self.cache.replay_batch([
+            (100, ('cleanup',)),
+            (100, ('cleanup_expired_events',)),
+        ])
+        self.assertEqual((results[0].values_removed, results[0].dedupe_removed), (1, 1))
+        self.assertEqual(results[1].events_removed, 1)
+        self.assertEqual(self.cache.pop_batch(), ['e2'])
+
+    def test_cleanup_expired_events_boundary_inclusive(self):
+        self.cache.replay_batch([
+            (10, ('push_expiring', 'd', 'e', 10, 5)),  # 到期点 15
+            (14, ('cleanup_expired_events',)),
+        ])
+        self.assertEqual(self.cache.queue_status().size, 1)
+        results = self.cache.replay_batch([(15, ('cleanup_expired_events',))])
+        self.assertEqual(results[0].events_removed, 1)
+        self.assertIsNone(self.cache.pop())
+
+    def test_accepts_generator_and_list_records(self):
+        gen = (record for record in [(1, ('put', 'a', 1, 10)), (2, ('delete', 'a'))])
+        results = self.cache.replay_batch(gen)
+        self.assertTrue(results[0].accepted)
+        self.assertTrue(results[1].deleted)
+
+    # ---- 校验：失败原子、不读时钟 ----
+    def assert_replay_rejected(self, records, exc_type):
+        before = (dict(self.cache.values), list(self.cache.events),
+                  list(self.cache.event_expiries), dict(self.cache.seen))
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(exc_type):
+            self.cache.replay_batch(records)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        after = (dict(self.cache.values), list(self.cache.events),
+                 list(self.cache.event_expiries), dict(self.cache.seen))
+        self.assertEqual(before, after)
+
+    def test_non_iterable_records_raise_value_error(self):
+        for bad in (None, 42, 3.14, True):
+            self.assert_replay_rejected(bad, ValueError)
+
+    def test_record_not_pair_raises_value_error(self):
+        for bad in (
+            [(10,)],
+            [(10, ('cleanup',), 'extra')],
+            [()],
+            [42],
+            ['ab'],
+        ):
+            self.assert_replay_rejected(bad, ValueError)
+
+    def test_invalid_timestamp_raises_value_error(self):
+        for bad_ts in (True, False, float('nan'), float('inf'), -float('inf'), '10', None, 1.0j):
+            self.assert_replay_rejected([(bad_ts, ('cleanup',))], ValueError)
+
+    def test_time_regression_raises_value_error(self):
+        self.assert_replay_rejected(
+            [(10, ('put', 'a', 'v', 5)), (9, ('put', 'b', 'v', 5))], ValueError)
+        self.assertEqual(self.cache.values, {})
+
+    def test_negative_and_float_timestamps_accepted(self):
+        results = self.cache.replay_batch([
+            (-5, ('put', 'a', 'v', 10)),   # 到期点 5
+            (-5, ('push', 'd', 'e', 10)),
+            (2.5, ('cleanup',)),           # 5 > 2.5：未到期，不清理
+        ])
+        self.assertTrue(all(r is not None for r in results))
+        self.assertEqual(results[2].values_removed, 0)
+        self.assertIn('a', self.cache.values)
+        results = self.cache.replay_batch([(5, ('cleanup',))])  # 到期点 <= 记录时刻
+        self.assertEqual(results[0].values_removed, 1)
+        self.assertEqual(self.cache.values, {})
+
+    def test_invalid_operation_raises_value_error_atomically(self):
+        for bad in (
+            [(1, ('put', 'a', 'v', 10)), (2, 'not-a-tuple')],
+            [(1, ('put', 'a', 'v', 10)), (2, ())],
+            [(1, ('put', 'a', 'v', 10)), (2, ('unknown',))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('put', 'a', 'v'))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('put', 'a', 'v', -1))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('push', 'd', 'e', float('nan')))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('push_expiring', 'd', 'e', 10, True))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('cleanup', 'x'))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('cleanup_expired_events', 'x'))],
+        ):
+            self.assert_replay_rejected(bad, ValueError)
+        self.assertEqual(self.cache.values, {})
+
+    def test_unhashable_key_or_dedupe_raises_type_error_atomically(self):
+        for bad in (
+            [(1, ('put', ['k'], 'v', 10))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('delete', ['k']))],
+            [(1, ('push', ['d'], 'e', 10))],
+            [(1, ('put', 'a', 'v', 10)), (2, ('push_expiring', {'d': 1}, 'e', 10, 5))],
+        ):
+            self.assert_replay_rejected(bad, TypeError)
+        self.assertEqual(self.cache.values, {})
+        self.assertEqual(self.cache.seen, {})
+
+    def test_error_precedence_follows_record_order(self):
+        # 先出现时间倒退：ValueError 优先于后项的 TypeError
+        self.assert_replay_rejected(
+            [(10, ('cleanup',)), (5, ('put', ['k'], 'v', 1))], ValueError)
+        # 先出现不可哈希 key：TypeError 优先于后项的 ValueError
+        self.assert_replay_rejected(
+            [(1, ('put', ['k'], 'v', 1)), (2, ('put', 'a', 'v', -1))], TypeError)
+
+    def test_later_invalid_record_rolls_back_whole_batch(self):
+        cache = self.make(1)
+        with self.assertRaises(ValueError):
+            cache.replay_batch([
+                (1, ('push_expiring', 'd', 'e', 10, 5)),
+                (2, ('push', 'd2', 'e2', -1)),
+            ])
+        self.assertEqual(cache.queue_status().size, 0)
+        self.assertEqual(cache.seen, {})
+        self.assertEqual(list(cache.event_expiries), [])
+
+    def test_failed_replay_preserves_existing_state(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push('d0', 'e0', 100)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.replay_batch([(1, ('put', 'a', 'v', 10)), (2, ('delete',))])
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.get('k'), 'v')
+        self.assertEqual(self.cache.pop(), 'e0')
+
+    # ---- 与快照/恢复协作 ----
+    def test_replayed_expiries_survive_snapshot_restore(self):
+        self.cache.replay_batch([
+            (10, ('put', 'a', 'v', 5)),
+            (10, ('push_expiring', 'd', 'e', 10, 50)),
+        ])
+        snap = self.cache.snapshot()
+        self.assertEqual(snap.values['a'], ('v', 15))
+        self.assertEqual(snap['event_expiries'], [60])
+        target = EventCache(self.clock)
+        target.restore(snap)
+        self.assertEqual(target.values['a'], ('v', 15))
+        self.assertEqual(list(target.event_expiries), [60])
+        self.assertEqual(target.snapshot(), snap)
+
+    def test_old_format_snapshot_still_restorable_after_replay(self):
+        self.cache.replay_batch([(10, ('push', 'd', 'e', 10))])
+        target = EventCache(self.clock)
+        target.restore({'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None})
+        self.assertEqual(list(target.event_expiries), [None])
+        self.assertEqual(target.pop_batch(), ['a'])
+
+
 if __name__ == '__main__':
     unittest.main()
