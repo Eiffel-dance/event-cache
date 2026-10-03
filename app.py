@@ -100,6 +100,56 @@ def _parse_batch(batch):
     return entries
 
 
+def _parse_operation(item):
+    """校验单个带标签操作元组并返回规范化后的操作。
+
+    支持 ('put', key, value, ttl)、('delete', key)、
+    ('push', dedupe, event, window)、
+    ('push_expiring', dedupe, event, window, event_ttl) 与 ('cleanup',)。
+    条目不是元组、标签未知、元组长度不符或 ttl/window/event_ttl 非法时
+    统一抛出 ValueError；key/dedupe 不可哈希、无法作为缓存索引时抛出
+    TypeError。供 apply_batch 与 replay_batch 共用，保证两处对同一操作
+    结构的校验结论完全一致。
+    """
+    if not isinstance(item, tuple) or len(item) == 0:
+        raise ValueError('each operation must be a tagged tuple')
+    tag = item[0]
+    if tag == 'put':
+        if len(item) != 4:
+            raise ValueError("'put' operation must be ('put', key, value, ttl)")
+        _, key, value, ttl = item
+        _check_duration(ttl, 'ttl')
+        hash(key)  # 不可哈希时原样抛出 TypeError
+        return ('put', key, value, ttl)
+    if tag == 'delete':
+        if len(item) != 2:
+            raise ValueError("'delete' operation must be ('delete', key)")
+        _, key = item
+        hash(key)
+        return ('delete', key)
+    if tag == 'push':
+        if len(item) != 4:
+            raise ValueError("'push' operation must be ('push', dedupe, event, window)")
+        _, dedupe, event, window = item
+        _check_duration(window, 'window')
+        hash(dedupe)
+        return ('push', dedupe, event, window)
+    if tag == 'push_expiring':
+        if len(item) != 5:
+            raise ValueError(
+                "'push_expiring' operation must be ('push_expiring', dedupe, event, window, event_ttl)")
+        _, dedupe, event, window, event_ttl = item
+        _check_duration(window, 'window')
+        _check_duration(event_ttl, 'event_ttl')
+        hash(dedupe)
+        return ('push_expiring', dedupe, event, window, event_ttl)
+    if tag == 'cleanup':
+        if len(item) != 1:
+            raise ValueError("'cleanup' operation must be ('cleanup',)")
+        return ('cleanup',)
+    raise ValueError('unknown operation tag: %r' % (tag,))
+
+
 def _parse_apply_batch(batch):
     """在读取时钟或改变任何状态前完整解析并校验事务批次。
 
@@ -115,47 +165,52 @@ def _parse_apply_batch(batch):
         iterator = iter(batch)
     except TypeError:
         raise ValueError('operations must be an iterable of operation tuples')
-    operations = []
+    return [_parse_operation(item) for item in iterator]
+
+
+def _parse_replay_batch(records):
+    """在读取时钟或改变任何状态前完整解析并校验带回放时间戳的记录批次。
+
+    records 必须可迭代，每项为 (timestamp, operation) 二元结构。timestamp
+    只能是非 bool 的有限 int/float（允许负数等任意绝对时刻），且必须按
+    非递减顺序出现，时间倒退抛出 ValueError；operation 在 apply_batch 的
+    put/delete/push/push_expiring/cleanup 之外额外接受
+    ('cleanup_expired_events',)，其余结构、标签、参数数量、时长校验与
+    apply_batch 完全一致。records 不可迭代、记录不是二元结构或操作非法时
+    统一抛出 ValueError；key/dedupe 不可哈希时原样抛出 TypeError。
+    返回物化后的 (timestamp, operation) 列表，供调用方按各自时间戳顺序执行。
+    """
+    try:
+        iterator = iter(records)
+    except TypeError:
+        raise ValueError('records must be an iterable of (timestamp, operation) pairs')
+    parsed = []
+    last_timestamp = None
     for item in iterator:
-        if not isinstance(item, tuple) or len(item) == 0:
-            raise ValueError('each operation must be a tagged tuple')
-        tag = item[0]
-        if tag == 'put':
-            if len(item) != 4:
-                raise ValueError("'put' operation must be ('put', key, value, ttl)")
-            _, key, value, ttl = item
-            _check_duration(ttl, 'ttl')
-            hash(key)  # 不可哈希时原样抛出 TypeError
-            operations.append(('put', key, value, ttl))
-        elif tag == 'delete':
-            if len(item) != 2:
-                raise ValueError("'delete' operation must be ('delete', key)")
-            _, key = item
-            hash(key)
-            operations.append(('delete', key))
-        elif tag == 'push':
-            if len(item) != 4:
-                raise ValueError("'push' operation must be ('push', dedupe, event, window)")
-            _, dedupe, event, window = item
-            _check_duration(window, 'window')
-            hash(dedupe)
-            operations.append(('push', dedupe, event, window))
-        elif tag == 'push_expiring':
-            if len(item) != 5:
+        try:
+            members = tuple(item)
+        except TypeError:
+            raise ValueError('each record must be a (timestamp, operation) pair')
+        if len(members) != 2:
+            raise ValueError('each record must be a (timestamp, operation) pair')
+        timestamp, operation = members
+        # 时间戳是时间轴上的绝对点：非 bool 的有限 int/float，允许负数
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise ValueError('timestamp must be a finite number')
+        if not math.isfinite(timestamp):
+            raise ValueError('timestamp must be a finite number')
+        if last_timestamp is not None and timestamp < last_timestamp:
+            raise ValueError('timestamps must be in non-decreasing order')
+        last_timestamp = timestamp
+        if isinstance(operation, tuple) and len(operation) > 0 \
+                and operation[0] == 'cleanup_expired_events':
+            if len(operation) != 1:
                 raise ValueError(
-                    "'push_expiring' operation must be ('push_expiring', dedupe, event, window, event_ttl)")
-            _, dedupe, event, window, event_ttl = item
-            _check_duration(window, 'window')
-            _check_duration(event_ttl, 'event_ttl')
-            hash(dedupe)
-            operations.append(('push_expiring', dedupe, event, window, event_ttl))
-        elif tag == 'cleanup':
-            if len(item) != 1:
-                raise ValueError("'cleanup' operation must be ('cleanup',)")
-            operations.append(('cleanup',))
+                    "'cleanup_expired_events' operation must be ('cleanup_expired_events',)")
+            parsed.append((timestamp, ('cleanup_expired_events',)))
         else:
-            raise ValueError('unknown operation tag: %r' % (tag,))
-    return operations
+            parsed.append((timestamp, _parse_operation(operation)))
+    return parsed
 
 
 def _parse_snapshot(snapshot):
@@ -283,14 +338,8 @@ class EventCache:
         values_removed, dedupe_removed = self._cleanup_at(now)
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
-    def cleanup_expired_events(self):
-        """单次读取时钟，移除所有已到期的带 TTL 事件。
-
-        到期边界与 values/seen 一致：到期点 <= 当前时刻即移除。未到期事件
-        与未设置事件 TTL 的旧事件一律保留且相对顺序不变；values、seen 与
-        max_queue 不受影响。返回 Result(events_removed=移除数量)。
-        """
-        now = self.clock()
+    def _cleanup_expired_events_at(self, now):
+        # 在指定时刻移除所有已到期的带 TTL 事件，返回 Result(events_removed=...)
         kept_events = deque()
         kept_expiries = deque()
         events_removed = 0
@@ -303,6 +352,16 @@ class EventCache:
         self.events = kept_events
         self.event_expiries = kept_expiries
         return Result(events_removed=events_removed)
+
+    def cleanup_expired_events(self):
+        """单次读取时钟，移除所有已到期的带 TTL 事件。
+
+        到期边界与 values/seen 一致：到期点 <= 当前时刻即移除。未到期事件
+        与未设置事件 TTL 的旧事件一律保留且相对顺序不变；values、seen 与
+        max_queue 不受影响。返回 Result(events_removed=移除数量)。
+        """
+        now = self.clock()
+        return self._cleanup_expired_events_at(now)
 
     def _try_push_at(self, dedupe, event, window, now, event_ttl=None):
         # 在指定时钟时刻判定一次入队：window/event_ttl 由调用方先行校验
@@ -391,6 +450,62 @@ class EventCache:
                         values_removed=values_removed,
                         dedupe_removed=dedupe_removed,
                     ))
+        return results
+
+    def replay_batch(self, records):
+        """确定性地重放一批带逻辑时间戳的操作记录。
+
+        先完整解析并校验整个批次：在此之前不读取时钟、不改变任何状态，
+        任一记录非法时整批拒绝，缓存保持原样。每项记录为
+        (timestamp, operation)，timestamp 是非 bool 的有限 int/float 且
+        按非递减顺序出现；operation 沿用 apply_batch 的 put/delete/push/
+        push_expiring/cleanup 语义，并额外接受 ('cleanup_expired_events',)。
+
+        回放只使用记录自带的时间戳作为当前时刻，全程不调用注入的 clock、
+        不启动后台线程；空记录返回空列表且不读时钟。每条记录以自己的
+        timestamp 计算 ttl、event_ttl 与去重窗口的绝对边界，同一时间戳的
+        多条记录共享该边界；时间推进本身不会自动清理 values、seen 或事件，
+        只有记录中显式的 cleanup/cleanup_expired_events 才执行清理。
+
+        成功时返回与输入逐项对应的 Result 列表：put 为
+        Result(accepted=True, reason=None)，push/push_expiring 仅以
+        accepted 与 reason（None、'dedupe_window' 或 'queue_full'）表示，
+        delete 为 Result(deleted=...)，cleanup 为
+        Result(values_removed=..., dedupe_removed=...)，
+        cleanup_expired_events 为 Result(events_removed=...)。
+        回放写入的绝对到期时间与常规入口一致，可由 snapshot 保存并由
+        restore 恢复。
+        """
+        # 先完整校验批次结构、时间戳与每项操作：在此之前不读取时钟、不改变任何状态
+        parsed = _parse_replay_batch(records)
+        results = []
+        for timestamp, op in parsed:
+            tag = op[0]
+            if tag == 'put':
+                _, key, value, ttl = op
+                self._put_at(key, value, ttl, timestamp)
+                results.append(Result(accepted=True, reason=None))
+            elif tag == 'delete':
+                _, key = op
+                # delete 本身不读取时钟，语义与单项入口一致
+                results.append(Result(deleted=self.delete(key)))
+            elif tag == 'push':
+                _, dedupe, event, window = op
+                # 前序记录已立即更新状态，本项以自身时间戳据此判定
+                reason = self._try_push_at(dedupe, event, window, timestamp)
+                results.append(Result(accepted=reason is None, reason=reason))
+            elif tag == 'push_expiring':
+                _, dedupe, event, window, event_ttl = op
+                reason = self._try_push_at(dedupe, event, window, timestamp, event_ttl)
+                results.append(Result(accepted=reason is None, reason=reason))
+            elif tag == 'cleanup':
+                values_removed, dedupe_removed = self._cleanup_at(timestamp)
+                results.append(Result(
+                    values_removed=values_removed,
+                    dedupe_removed=dedupe_removed,
+                ))
+            else:  # 'cleanup_expired_events'
+                results.append(self._cleanup_expired_events_at(timestamp))
         return results
 
     def pop(self):
