@@ -422,6 +422,26 @@ class EventCache:
             self.event_expiries.popleft()
         return taken
 
+    def peek(self, limit=None):
+        """非破坏性地查看队头事件：按插入顺序返回前缀，不移除任何事件。
+
+        limit 为 None（缺省）时返回当前队列的全部内容；为非负整数时最多返回
+        该数量的队头前缀，数量不足只返回实际存在的事件。纯查看操作：不读取
+        时钟、不触发过期清理、不触碰 event_expiries/values/seen/max_queue，
+        队列中的 None 与其他对象按原引用返回。空队列与 limit 为零同样不读取
+        时钟。limit 为负数、浮点数、字符串、布尔值或其他非整数时抛出
+        ValueError，抛出前不改变任何状态。
+        """
+        if limit is None:
+            count = len(self.events)
+        else:
+            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError('limit must be None or a non-negative integer')
+            count = min(limit, len(self.events))
+        # 只物化队头前缀副本，deque 本身保持不变
+        return [self.events[i] for i in range(count)]
+
     def pop_live_batch(self, limit=None):
         """过期感知的批量出队：一次时钟判断同时给出有效事件与被丢弃事件。
 
@@ -463,6 +483,50 @@ class EventCache:
             expiry = self.event_expiries.popleft()
             if expiry is not None and expiry <= now:
                 # 到期边界与 values/seen/cleanup_expired_events 一致：<= 即过期
+                discarded.append(Result(event=event, reason='event_ttl'))
+            else:
+                events.append(event)
+                if limit is not None and len(events) >= limit:
+                    break
+        return Result(events=events, discarded=discarded)
+
+    def peek_live_batch(self, limit=None):
+        """非破坏性地预览 pop_live_batch：同样的 TTL 判定与边界，但不移除事件。
+
+        按当前队列的插入顺序从队头扫描：未设置 event_ttl 的事件始终有效，
+        原样放入 events；设置了 event_ttl 且绝对到期点 <= 本次读取时刻的事件
+        归入 discarded，按原顺序追加 Result(event=原事件值, reason='event_ttl')。
+        与 pop_live_batch 的唯一区别是不出队：任何情况下都不移除事件、不释放
+        容量、不清理 values 或 seen，未扫描的尾部保持队列原状。
+
+        limit 为 None（缺省）时扫描整个队列；为正整数时在预览到该数量的有效
+        事件后立即停止扫描，其后的事件（含恰好已到期者）一律不检查；为 0 时
+        不读取时钟也不改变状态，直接返回两个空列表。队列为空时同样不读取
+        时钟；非空且需要扫描时整次调用只读取一次注入时钟，时钟抛出的异常
+        原样传播且状态保持完整。
+
+        limit 不是 None 且不是非 bool 的非负整数（负数、浮点数、字符串、
+        布尔值等）时抛出 ValueError，抛出前不读取时钟、不改变任何状态。
+        返回 Result(events=有效事件列表, discarded=丢弃结果列表)，两者均为
+        普通 list。
+        """
+        if limit is not None:
+            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError('limit must be None or a non-negative integer')
+            if limit == 0:
+                # 显式零配额：不读时钟、不扫描、不改状态
+                return Result(events=[], discarded=[])
+        if not self.events:
+            # 空队列不读取时钟
+            return Result(events=[], discarded=[])
+        now = self.clock()
+        events = []
+        discarded = []
+        # 只读扫描：索引遍历而不 popleft，队列与 event_expiries 原样保留
+        for event, expiry in zip(self.events, self.event_expiries):
+            if expiry is not None and expiry <= now:
+                # 到期边界与 pop_live_batch 一致：<= 即过期
                 discarded.append(Result(event=event, reason='event_ttl'))
             else:
                 events.append(event)
