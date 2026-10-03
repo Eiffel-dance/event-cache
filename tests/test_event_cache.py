@@ -2374,5 +2374,533 @@ class ReplayBatchTest(unittest.TestCase):
         self.assertEqual(list(self.cache.events), ['e'])  # 前段记录也不得生效
 
 
+class OverflowPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, max_queue=None, overflow_policy=None):
+        if overflow_policy is None:
+            return EventCache(self.clock, max_queue=max_queue)
+        return EventCache(self.clock, max_queue=max_queue,
+                          overflow_policy=overflow_policy)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 构造参数：默认值与校验 ----
+    def test_default_policy_is_reject_new(self):
+        cache = EventCache(self.clock)
+        self.assertEqual(cache.overflow_policy, 'reject_new')
+        cache = EventCache(self.clock, max_queue=2)
+        self.assertEqual(cache.overflow_policy, 'reject_new')
+        cache = EventCache(self.clock, overflow_policy=None)
+        self.assertEqual(cache.overflow_policy, 'reject_new')
+        cache = EventCache(self.clock, overflow_policy='reject_new')
+        self.assertEqual(cache.overflow_policy, 'reject_new')
+
+    def test_drop_oldest_policy_accepted(self):
+        cache = EventCache(self.clock, overflow_policy='drop_oldest')
+        self.assertEqual(cache.overflow_policy, 'drop_oldest')
+
+    def test_invalid_overflow_policy_raises_value_error(self):
+        for bad in ('', 'drop-new', 'DROP_OLDEST', 'reject', 'reject_old',
+                    'drop_oldest ', ' drop_oldest', True, False, 0, 1, 1.0,
+                    [], ['drop_oldest'], object()):
+            with self.assertRaises(ValueError):
+                EventCache(self.clock, overflow_policy=bad)
+        # 不可哈希策略值同样报 ValueError（而非 TypeError）
+        with self.assertRaises(ValueError):
+            EventCache(self.clock, overflow_policy={})
+        with self.assertRaises(ValueError):
+            EventCache(self.clock, overflow_policy={'a': 1})
+
+    def test_invalid_overflow_policy_does_not_accept_none_positional_confusion(self):
+        # 显式传入非法值必须报错；None 仅作为省略处理
+        with self.assertRaises(ValueError):
+            EventCache(self.clock, max_queue=1, overflow_policy='reject-old')
+
+    # ---- 默认策略结果形状完全不变 ----
+    def test_default_policy_results_have_no_discarded_field(self):
+        cache = self.make(max_queue=1)
+        cache.push('d1', 'e1', 100)
+        r = cache.push_with_reason('d2', 'e2', 100)  # queue_full
+        self.assertEqual(set(r), {'accepted', 'reason'})
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'queue_full')
+
+        results = cache.push_batch([('d3', 'e3', 100)])
+        self.assertEqual(set(results[0]), {'accepted', 'reason'})
+        results = cache.apply_batch([('push', 'd4', 'e4', 100)])
+        self.assertEqual(set(results[0]), {'accepted', 'reason'})
+
+    def test_default_policy_replay_results_have_no_discarded_field(self):
+        cache = self.make(max_queue=1)
+        results = cache.replay_batch([
+            (0, ('push', 'd1', 'e1', 100)),
+            (1, ('push', 'd2', 'e2', 100)),
+        ])
+        self.assertEqual(set(results[0]), {'accepted', 'reason'})
+        self.assertEqual(set(results[1]), {'accepted', 'reason'})
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_default_policy_full_queue_keeps_reject_semantics(self):
+        cache = self.make(max_queue=2)
+        self.assertTrue(cache.push('d1', 'e1', 100))
+        self.assertTrue(cache.push('d2', 'e2', 100))
+        self.assertFalse(cache.push('d3', 'e3', 100))
+        self.assertEqual(cache.pop_batch(), ['e1', 'e2'])
+
+    # ---- drop_oldest：基本挤出语义 ----
+    def test_drop_oldest_removes_fifo_head_and_accepts_new(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        self.assertTrue(cache.push('d1', 'e1', 100))
+        self.assertTrue(cache.push('d2', 'e2', 100))
+        r = cache.push_with_reason('d3', 'e3', 100)
+        self.assertTrue(r.accepted)
+        self.assertIsNone(r.reason)
+        self.assertEqual(cache.queue_status().size, 2)
+        self.assertEqual(cache.pop_batch(), ['e2', 'e3'])  # e1 被挤出，不再出队
+
+    def test_drop_oldest_discarded_reports_head_event(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        r = cache.push_with_reason('d2', 'e2', 100)
+        self.assertEqual(len(r.discarded), 1)
+        d = r.discarded[0]
+        self.assertIsInstance(d, Result)
+        self.assertEqual(set(d), {'event', 'reason'})
+        self.assertEqual(d.event, 'e1')
+        self.assertEqual(d['event'], 'e1')
+        self.assertEqual(d.reason, 'queue_full')
+
+    def test_drop_oldest_discarded_empty_when_not_full(self):
+        cache = self.make(max_queue=3, overflow_policy='drop_oldest')
+        r = cache.push_with_reason('d1', 'e1', 100)
+        self.assertTrue(r.accepted)
+        self.assertEqual(r.discarded, [])
+        r = cache.push_with_reason('d2', 'e2', 100)
+        self.assertEqual(r.discarded, [])
+
+    def test_drop_oldest_none_head_event_is_preserved_in_discarded(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', None, 100)
+        r = cache.push_with_reason('d2', 'e2', 100)
+        self.assertEqual(len(r.discarded), 1)
+        self.assertIsNone(r.discarded[0].event)
+        self.assertEqual(r.discarded[0].reason, 'queue_full')
+        self.assertEqual(cache.pop_batch(), ['e2'])
+
+    def test_push_boolean_still_returns_true_after_squeeze(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        self.assertIs(cache.push('d2', 'e2', 100), True)
+        self.assertIs(cache.push_expiring('d3', 'e3', 100, 50), True)
+        self.assertEqual(cache.pop_batch(), ['e3'])
+
+    def test_drop_oldest_repeatedly_squeezes_heads(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        r1 = cache.push_with_reason('d3', 'e3', 100)
+        r2 = cache.push_with_reason('d4', 'e4', 100)
+        self.assertEqual([d.event for d in r1.discarded], ['e1'])
+        self.assertEqual([d.event for d in r2.discarded], ['e2'])
+        self.assertEqual(cache.pop_batch(), ['e3', 'e4'])
+
+    def test_drop_oldest_unlimited_queue_never_discards(self):
+        cache = self.make(max_queue=None, overflow_policy='drop_oldest')
+        for i in range(50):
+            r = cache.push_with_reason('d%d' % i, 'e%d' % i, 100)
+            self.assertTrue(r.accepted)
+            self.assertEqual(r.discarded, [])
+        self.assertEqual(cache.queue_status().size, 50)
+
+    # ---- 容量为零：拒绝且不丢弃 ----
+    def test_drop_oldest_zero_capacity_rejects_without_discarding(self):
+        cache = self.make(max_queue=0, overflow_policy='drop_oldest')
+        self.assertFalse(cache.push('d', 'e', 100))
+        r = cache.push_with_reason('d2', 'e2', 100)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertEqual(r.discarded, [])
+        self.assertEqual(cache.queue_status().size, 0)
+        self.assertNotIn('d2', cache.seen)
+        self.assertIsNone(cache.pop())
+
+    def test_drop_oldest_zero_capacity_restored_with_residual_events_discards_nothing(self):
+        # 防御性边界：从零容量快照恢复出残留事件时，drop_oldest 也不允许挤出
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.restore({
+            'values': {}, 'events': ['leftover'], 'seen': {}, 'max_queue': 0,
+            'overflow_policy': 'drop_oldest',
+        })
+        r = cache.push_with_reason('d', 'e', 100)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertEqual(r.discarded, [])
+        # 残留事件不被丢弃，仍按 FIFO 可取出
+        self.assertEqual(cache.pop(), 'leftover')
+
+    # ---- 去重窗口优先：不为腾位挤出任何事件 ----
+    def test_dedupe_window_priority_never_squeezes(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        r = cache.push_with_reason('d1', 'dup', 100)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'dedupe_window')
+        self.assertEqual(r.discarded, [])
+        self.assertEqual(cache.queue_status().size, 1)
+        self.assertEqual(cache.pop(), 'e1')  # 队首未被动过
+
+    def test_squeezed_event_dedupe_record_remains_until_window_end(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)   # seen d1 -> 200
+        cache.push('d2', 'e2', 100)
+        cache.push_with_reason('d3', 'e3', 100)  # 挤出 e1，但 d1 去重保留
+        self.assertIn('d1', cache.seen)
+        self.assertEqual(cache.seen['d1'], 200)
+        r = cache.push_with_reason('d1', 'again', 100)  # 窗口优先，不挤出
+        self.assertEqual(r.reason, 'dedupe_window')
+        self.assertEqual(r.discarded, [])
+        self.assertEqual(cache.pop_batch(), ['e2', 'e3'])
+
+    def test_squeezed_dedupe_can_expire_and_reenter(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 10)  # seen d1 -> 110
+        cache.push_with_reason('d2', 'e2', 100)  # 挤出 e1
+        self.advance(10)  # d1 去重窗口到期（<= 边界）
+        r = cache.push_with_reason('d1', 'e3', 100)
+        self.assertTrue(r.accepted)
+        self.assertEqual([d.event for d in r.discarded], ['e2'])
+        self.assertEqual(cache.pop_batch(), ['e3'])
+
+    def test_accepted_squeeze_registers_new_dedupe(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        cache.push_with_reason('d2', 'e2', 100)
+        self.assertIn('d2', cache.seen)
+        # d2 的新窗口立即生效：重复 d2 被去重，而不是再挤出 e2
+        r = cache.push_with_reason('d2', 'dup', 100)
+        self.assertEqual(r.reason, 'dedupe_window')
+        self.assertEqual(r.discarded, [])
+
+    # ---- event_ttl 元数据随挤出同步移除 ----
+    def test_squeeze_removes_aligned_event_expiry(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.push_expiring('d1', 'e1', 100, 5)   # 到期点 105
+        cache.push('d2', 'e2', 100)               # None
+        cache.push_with_reason('d3', 'e3', 100)   # 挤出 e1 及其到期元数据
+        self.assertEqual(list(cache.event_expiries), [None, None])
+        self.advance(10)
+        # e1 的 TTL 元数据已不存在：清理只可能影响队中其他项
+        self.assertEqual(cache.cleanup_expired_events().events_removed, 0)
+        self.assertEqual(cache.pop_batch(), ['e2', 'e3'])
+
+    def test_squeezed_expiring_head_reported_and_new_expiry_recorded(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push_expiring('d1', 'e1', 100, 500)
+        r = cache.push_expiring_with_reason('d2', 'e2', 100, 5)
+        self.assertEqual([(d.event, d.reason) for d in r.discarded],
+                         [('e1', 'queue_full')])
+        self.assertEqual(list(cache.event_expiries), [105])
+        self.advance(10)
+        self.assertEqual(cache.cleanup_expired_events().events_removed, 1)
+        self.assertIsNone(cache.pop())
+
+    # ---- 释放/出队接口对被挤项目不可见 ----
+    def test_squeezed_items_invisible_to_all_dequeue_paths(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        cache.push_with_reason('d3', 'e3', 100)  # 挤出 e1
+        self.assertEqual(cache.peek(), ['e2', 'e3'])
+        self.assertEqual(cache.peek(1), ['e2'])
+        self.assertEqual(cache.pop(), 'e2')
+        self.assertEqual(cache.pop_batch(), ['e3'])
+        self.assertEqual(cache.pop_batch(), [])
+        self.assertIsNone(cache.pop())
+
+    def test_squeezed_expired_event_does_not_reappear_in_live_batch(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push_expiring('d1', 'x', 100, 0)  # 已到期
+        cache.push_with_reason('d2', 'a', 100)  # 挤出过期队首
+        r = cache.pop_live_batch()
+        self.assertEqual(r.events, ['a'])
+        self.assertEqual(r.discarded, [])  # 被挤出项目不再以 event_ttl 出现
+
+    # ---- 批处理：逐项 discarded ----
+    def test_push_batch_drop_oldest_discarded_per_entry(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        results = cache.push_batch([
+            ('d1', 'e1', 100),
+            ('d2', 'e2', 100),
+            ('d3', 'e3', 100),  # 挤出 e1
+            ('d1', 'dup', 100),  # 去重优先，无挤出
+            ('d4', 'e4', 100),  # 挤出 e2
+        ])
+        self.assertEqual([r.accepted for r in results],
+                         [True, True, True, False, True])
+        self.assertEqual(results[3].reason, 'dedupe_window')
+        self.assertEqual([[d.event for d in r.discarded] for r in results],
+                         [[], [], ['e1'], [], ['e2']])
+        self.assertEqual(cache.pop_batch(), ['e3', 'e4'])
+        self.assertEqual(self.clock_calls[0], 1)  # 整批仍只读一次时钟
+
+    def test_apply_batch_drop_oldest_discarded_per_entry(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        results = cache.apply_batch([
+            ('push', 'd1', 'e1', 100),
+            ('push_expiring', 'd2', 'e2', 100, 5),
+            ('push', 'd3', 'e3', 100),
+        ])
+        self.assertEqual([r.accepted for r in results], [True, True, True])
+        self.assertEqual([d.event for d in results[1].discarded], ['e1'])
+        self.assertEqual([d.event for d in results[2].discarded], ['e2'])
+        # e2 的到期元数据随挤出移除；e3 是普通 push -> None
+        self.assertEqual(list(cache.event_expiries), [None])
+
+    def test_batch_drop_oldest_zero_capacity_rejects_all(self):
+        cache = self.make(max_queue=0, overflow_policy='drop_oldest')
+        results = cache.push_batch([('d1', 'e1', 100), ('d2', 'e2', 100)])
+        self.assertEqual([(r.accepted, r.reason, r.discarded) for r in results], [
+            (False, 'queue_full', []),
+            (False, 'queue_full', []),
+        ])
+        self.assertEqual(cache.seen, {})
+
+    def test_batch_validation_still_atomic_under_drop_oldest(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.put('k', 'v', 100)
+        for bad, exc in (
+            ([('d1', 'e1', -1)], ValueError),
+            ([('d1', 'e1', 10), (['x'], 'e2', 10)], TypeError),
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(exc):
+                cache.push_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(cache.queue_status().size, 0)
+        self.assertEqual(cache.seen, {})
+
+    # ---- 回放：只用记录时间，入队结果带 discarded ----
+    def test_replay_drop_oldest_uses_record_time_with_discarded(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        results = cache.replay_batch([
+            (10, ('push', 'd1', 'e1', 100)),
+            (20, ('push_expiring', 'd2', 'e2', 100, 50)),
+            (30, ('push', 'd3', 'e3', 100)),       # 挤出 e1
+            (30, ('push', 'd1', 'dup', 100)),      # d1 窗口 110 > 30：去重
+            (200, ('push', 'd4', 'e4', 100)),      # 挤出 e2
+        ])
+        self.assertEqual(self.clock_calls[0], 0)  # 全程不读注入时钟
+        self.assertEqual([r.accepted for r in results],
+                         [True, True, True, False, True])
+        self.assertEqual(results[3].reason, 'dedupe_window')
+        self.assertEqual([d.event for d in results[2].discarded], ['e1'])
+        self.assertEqual([d.event for d in results[4].discarded], ['e2'])
+        self.assertEqual(list(cache.event_expiries), [None, None])  # e2 的 70 已移除
+        self.assertEqual(cache.pop_batch(), ['e3', 'e4'])
+
+    def test_replay_squeezed_item_gone_for_later_records(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        results = cache.replay_batch([
+            (0, ('push', 'd1', 'e1', 100)),
+            (1, ('push', 'd2', 'e2', 100)),  # 挤出 e1
+            (2, ('pop',)),
+            (3, ('pop',)),                   # 空队列 None
+        ])
+        self.assertEqual(results[2], 'e2')
+        self.assertIsNone(results[3])
+
+    def test_replay_validation_conventions_unchanged_under_drop_oldest(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        with self.assertRaises(ValueError):
+            cache.replay_batch([
+                (1, ('push', 'd1', 'e1', 100)),
+                (0, ('push', 'd2', 'e2', 100)),  # 时间倒退
+            ])
+        with self.assertRaises(TypeError):
+            cache.replay_batch([(1, ('push', ['d'], 'e', 100))])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(cache.queue_status().size, 0)
+
+
+class OverflowPolicySnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, overflow_policy=None):
+        if overflow_policy is None:
+            return EventCache(self.clock, max_queue=2)
+        return EventCache(self.clock, max_queue=2, overflow_policy=overflow_policy)
+
+    # ---- 默认策略快照不携带 overflow_policy ----
+    def test_default_policy_snapshot_keeps_old_shape(self):
+        cache = self.make()
+        cache.push('d1', 'e1', 100)
+        snap = cache.snapshot()
+        self.assertNotIn('overflow_policy', snap)
+        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+
+    def test_default_policy_with_expiries_snapshot_keeps_old_shape(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 100, 5)
+        snap = cache.snapshot()
+        self.assertNotIn('overflow_policy', snap)
+        self.assertEqual(set(snap),
+                         {'values', 'events', 'seen', 'max_queue', 'event_expiries'})
+
+    # ---- drop_oldest 快照保存策略 ----
+    def test_drop_oldest_snapshot_saves_policy(self):
+        cache = self.make('drop_oldest')
+        cache.push('d1', 'e1', 100)
+        snap = cache.snapshot()
+        self.assertEqual(snap['overflow_policy'], 'drop_oldest')
+        self.assertEqual(snap.overflow_policy, 'drop_oldest')
+        self.assertEqual(set(snap),
+                         {'values', 'events', 'seen', 'max_queue', 'overflow_policy'})
+
+    def test_drop_oldest_snapshot_with_expiries_saves_both(self):
+        cache = self.make('drop_oldest')
+        cache.push_expiring('d1', 'e1', 100, 5)
+        snap = cache.snapshot()
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'overflow_policy', 'event_expiries',
+        })
+        self.assertEqual(snap.overflow_policy, 'drop_oldest')
+        self.assertEqual(snap.event_expiries, [105])
+
+    def test_drop_oldest_round_trip_restores_policy_and_behavior(self):
+        cache = self.make('drop_oldest')
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        snap = cache.snapshot()
+        target = EventCache(self.clock)  # 默认策略构造
+        self.assertIsNone(target.restore(snap))
+        self.assertEqual(target.overflow_policy, 'drop_oldest')
+        r = target.push_with_reason('d3', 'e3', 100)
+        self.assertTrue(r.accepted)
+        self.assertEqual([d.event for d in r.discarded], ['e1'])
+        self.assertEqual(target.pop_batch(), ['e2', 'e3'])
+        # 恢复后再次快照与原快照等价（策略与状态均保留）
+        target2 = EventCache(self.clock)
+        target2.restore(snap)
+        self.assertEqual(target2.snapshot(), snap)
+
+    def test_restore_explicit_reject_new_policy(self):
+        target = self.make('drop_oldest')
+        target.restore({
+            'values': {}, 'events': ['e1', 'e2'], 'seen': {}, 'max_queue': 2,
+            'overflow_policy': 'reject_new',
+        })
+        self.assertEqual(target.overflow_policy, 'reject_new')
+        r = target.push_with_reason('d', 'e3', 100)
+        self.assertFalse(r.accepted)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertEqual(set(r), {'accepted', 'reason'})  # 无 discarded 字段
+
+    # ---- 旧格式快照按 reject_new 解释 ----
+    def test_old_four_field_snapshot_restored_as_reject_new(self):
+        target = self.make('drop_oldest')
+        target.restore({'values': {}, 'events': ['e1', 'e2'], 'seen': {},
+                        'max_queue': 2})
+        self.assertEqual(target.overflow_policy, 'reject_new')
+        r = target.push_with_reason('d', 'e3', 100)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertNotIn('discarded', r)
+
+    def test_old_five_field_snapshot_with_expiries_restored_as_reject_new(self):
+        target = self.make('drop_oldest')
+        target.restore({
+            'values': {}, 'events': ['e1'], 'seen': {}, 'max_queue': 2,
+            'event_expiries': [None],
+        })
+        self.assertEqual(target.overflow_policy, 'reject_new')
+        self.assertEqual(list(target.event_expiries), [None])
+
+    def test_old_format_round_trip_does_not_gain_policy_field(self):
+        cache = self.make('drop_oldest')
+        cache.restore({'values': {}, 'events': [], 'seen': {}, 'max_queue': None})
+        self.assertEqual(set(cache.snapshot()),
+                         {'values', 'events', 'seen', 'max_queue'})
+
+    # ---- 快照字段校验 ----
+    def test_restore_rejects_illegal_overflow_policy_atomically(self):
+        cache = self.make('drop_oldest')
+        cache.push('d0', 'e0', 100)
+        before = (dict(cache.values), list(cache.events), dict(cache.seen),
+                  cache.max_queue, cache.overflow_policy)
+        for bad in ('', 'reject', 'drop-oldest', 'DROP_OLDEST', True, 1, None, []):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(ValueError):
+                cache.restore({
+                    'values': {}, 'events': [], 'seen': {}, 'max_queue': 1,
+                    'overflow_policy': bad,
+                })
+            self.assertEqual(self.clock_calls[0], calls_before)  # 不读时钟
+        after = (dict(cache.values), list(cache.events), dict(cache.seen),
+                 cache.max_queue, cache.overflow_policy)
+        self.assertEqual(before, after)
+
+    def test_restore_rejects_unknown_field_even_with_policy(self):
+        cache = self.make('drop_oldest')
+        with self.assertRaises(ValueError):
+            cache.restore({
+                'values': {}, 'events': [], 'seen': {}, 'max_queue': 1,
+                'overflow_policy': 'drop_oldest', 'bogus': 1,
+            })
+
+    def test_restore_policy_field_with_expiries_accepted(self):
+        cache = self.make('drop_oldest')
+        self.assertIsNone(cache.restore({
+            'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': 1,
+            'overflow_policy': 'drop_oldest', 'event_expiries': [None, 5],
+        }))
+        self.assertEqual(cache.overflow_policy, 'drop_oldest')
+        self.assertEqual(list(cache.event_expiries), [None, 5])
+        r = cache.push_with_reason('d', 'c', 100)  # 挤出 a
+        self.assertEqual([d.event for d in r.discarded], ['a'])
+        self.assertEqual(list(cache.event_expiries), [5, None])
+
+    def test_failed_policy_restore_keeps_cache_functional(self):
+        cache = EventCache(self.clock, max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        with self.assertRaises(ValueError):
+            cache.restore({
+                'values': {}, 'events': [], 'seen': {}, 'max_queue': 1,
+                'overflow_policy': 'nonsense',
+            })
+        self.assertEqual(cache.overflow_policy, 'drop_oldest')
+        self.assertEqual(cache.max_queue, 1)
+        r = cache.push_with_reason('d2', 'e2', 100)
+        self.assertEqual([d.event for d in r.discarded], ['e1'])
+        self.assertEqual(cache.pop(), 'e2')
+
+    def test_snapshot_detached_after_policy_restore(self):
+        cache = self.make('drop_oldest')
+        snap = {
+            'values': {}, 'events': ['e1'], 'seen': {}, 'max_queue': 1,
+            'overflow_policy': 'drop_oldest',
+        }
+        cache.restore(snap)
+        cache.push_with_reason('d', 'e2', 100)  # 挤出 e1
+        self.assertEqual(snap['events'], ['e1'])  # 传入快照不受影响
+
+
 if __name__ == '__main__':
     unittest.main()

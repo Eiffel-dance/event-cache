@@ -2,8 +2,14 @@ import math
 from collections import deque
 from collections.abc import Mapping
 
+_REJECT_NEW = 'reject_new'
+_DROP_OLDEST = 'drop_oldest'
+
 _SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
+_SNAPSHOT_FIELDS_WITH_POLICY = _SNAPSHOT_FIELDS | frozenset(('overflow_policy',))
 _SNAPSHOT_FIELDS_WITH_EXPIRIES = _SNAPSHOT_FIELDS | frozenset(('event_expiries',))
+_SNAPSHOT_FIELDS_WITH_POLICY_AND_EXPIRIES = \
+    _SNAPSHOT_FIELDS | frozenset(('overflow_policy', 'event_expiries'))
 
 
 class Result(dict):
@@ -64,6 +70,16 @@ def _check_max_queue(value):
         return
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError('max_queue must be None or a non-negative integer')
+
+
+def _check_overflow_policy(value):
+    """overflow_policy 必须是 'reject_new' 或 'drop_oldest'。
+
+    非字符串（含 None、布尔、数字、列表等不可哈希值）一律报 ValueError，
+    而不是让集合成员判定抛出 TypeError。
+    """
+    if not isinstance(value, str) or value not in (_REJECT_NEW, _DROP_OLDEST):
+        raise ValueError("overflow_policy must be 'reject_new' or 'drop_oldest'")
 
 
 def _check_limit(value):
@@ -268,23 +284,29 @@ def _parse_replay_batch(records):
 def _parse_snapshot(snapshot):
     """在读取时钟或改变任何状态前完整解析并校验快照。
 
-    快照必须是含 values、events、seen、max_queue 四个字段的映射，或在此
-    基础上增加与 events 对齐的 event_expiries 字段：values 为
-    key -> (value, expires_at) 的映射，seen 为去重键 -> 绝对到期时间的
+    快照必须是含 values、events、seen、max_queue 四个字段的映射；可在此
+    基础上增加 overflow_policy 字段（'reject_new' 或 'drop_oldest'，缺省
+    视为 'reject_new'），以及与 events 对齐的 event_expiries 字段：values
+    为 key -> (value, expires_at) 的映射，seen 为去重键 -> 绝对到期时间的
     映射，events 为事件列表（按 FIFO 顺序），max_queue 为 None 或非负
     整数，event_expiries 为与 events 等长的列表，每项为 None（无事件
     TTL）或有限的绝对到期时刻。三类到期时间（values 的 expires_at、seen
     的到期时刻、event_expiries 的非 None 项）都只能是非 bool 的有限
     int/float，允许负数与已过期时刻，不解释为相对时长。字段缺失或多余、
-    非映射/列表容器、二元组结构不符、event_expiries 长度不一致或任一
-    到期值为 NaN/无穷/字符串/复合对象、max_queue 非法时统一抛出
-    ValueError；键不可哈希时原样抛出 TypeError。
+    非映射/列表容器、二元组结构不符、overflow_policy 非法、event_expiries
+    长度不一致或任一到期值为 NaN/无穷/字符串/复合对象、max_queue 非法时
+    统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
     校验期间一次性物化为全新的 dict/list/deque，供调用方随后整体替换状态。
     """
     if not isinstance(snapshot, Mapping):
         raise ValueError('snapshot must be a mapping with values, events, seen, max_queue')
     fields = frozenset(snapshot.keys())
-    if fields != _SNAPSHOT_FIELDS and fields != _SNAPSHOT_FIELDS_WITH_EXPIRIES:
+    if fields not in (
+        _SNAPSHOT_FIELDS,
+        _SNAPSHOT_FIELDS_WITH_POLICY,
+        _SNAPSHOT_FIELDS_WITH_EXPIRIES,
+        _SNAPSHOT_FIELDS_WITH_POLICY_AND_EXPIRIES,
+    ):
         raise ValueError('snapshot must contain exactly values, events, seen, max_queue')
 
     raw_values = snapshot['values']
@@ -297,6 +319,9 @@ def _parse_snapshot(snapshot):
     if not isinstance(raw_events, list):
         raise ValueError('snapshot events must be a list')
     _check_max_queue(snapshot['max_queue'])
+    overflow_policy = snapshot['overflow_policy'] \
+        if 'overflow_policy' in snapshot else _REJECT_NEW
+    _check_overflow_policy(overflow_policy)
 
     values = {}
     for key, item in raw_values.items():
@@ -326,14 +351,19 @@ def _parse_snapshot(snapshot):
     else:
         # 旧格式快照：所有事件均无 TTL
         event_expiries = deque([None] * len(raw_events))
-    return values, events, event_expiries, seen, snapshot['max_queue']
+    return values, events, event_expiries, seen, snapshot['max_queue'], overflow_policy
 
 
 class EventCache:
-    def __init__(self, clock, max_queue=None):
+    def __init__(self, clock, max_queue=None, overflow_policy=None):
         _check_max_queue(max_queue)
+        # 省略 overflow_policy（None）时沿用既有的 reject_new 语义
+        if overflow_policy is None:
+            overflow_policy = _REJECT_NEW
+        _check_overflow_policy(overflow_policy)
         self.clock = clock
         self.max_queue = max_queue
+        self.overflow_policy = overflow_policy
         self.values = {}
         self.events = deque()
         # 与 events 逐元素对齐：None 表示无事件 TTL，否则为绝对到期时刻
@@ -491,19 +521,39 @@ class EventCache:
         )
 
     def _try_push_at(self, dedupe, event, window, now, event_ttl=None):
-        # 在指定时钟时刻判定一次入队：window/event_ttl 由调用方先行校验
+        # 在指定时钟时刻判定一次入队：window/event_ttl 由调用方先行校验。
+        # 返回 (reason, discarded)：接受时 reason 为 None，discarded 为本次
+        # 因 drop_oldest 挤出的队首记录列表；其余情况 discarded 为空列表。
         expiry = self.seen.get(dedupe)
         if expiry is not None and expiry > now:
-            return 'dedupe_window'
-        # 去重已可用但队列已满：拒绝且不登记新的去重占用
+            # 窗口内请求优先：即使队列已满也只报 dedupe_window，绝不挤出事件
+            return 'dedupe_window', []
+        discarded = []
         if self.max_queue is not None and len(self.events) >= self.max_queue:
-            return 'queue_full'
+            # 去重已可用但队列已满：reject_new 拒绝且不登记新的去重占用；
+            # drop_oldest 仅在 max_queue 大于零时挤出 FIFO 队首，容量为零
+            # （例如从零容量快照恢复出残留事件）同样拒绝且不丢弃任何项目
+            if self.overflow_policy != _DROP_OLDEST or self.max_queue <= 0:
+                return 'queue_full', []
+            old_event = self.events.popleft()
+            self.event_expiries.popleft()
+            # 同步移除被挤出事件的 event_ttl 元数据；其 dedupe 记录保留到
+            # 原窗口截止，None 事件也必须保留在 discarded 中
+            discarded.append(Result(event=old_event, reason='queue_full'))
         # 记录不存在或到期点小于等于当前时刻：允许重新入队
         self.seen[dedupe] = now + window
         self.events.append(event)
         # 事件到期时刻 = 接受时刻 + event_ttl；event_ttl 为零即接受时已到期
         self.event_expiries.append(None if event_ttl is None else now + event_ttl)
-        return None
+        return None, discarded
+
+    def _push_result(self, reason, discarded):
+        # 构造单项/批量/回放共用的入队结果形状：仅 drop_oldest 策略附带
+        # discarded 列表，默认策略保持既有两字段形状不变
+        result = Result(accepted=reason is None, reason=reason)
+        if self.overflow_policy == _DROP_OLDEST:
+            result['discarded'] = discarded
+        return result
 
     def _try_push(self, dedupe, event, window):
         # 校验失败时不读取时钟，也不产生事件或去重记录
@@ -512,18 +562,18 @@ class EventCache:
         return self._try_push_at(dedupe, event, window, now)
 
     def push(self, dedupe, event, window):
-        return self._try_push(dedupe, event, window) is None
+        return self._try_push(dedupe, event, window)[0] is None
 
     def push_with_reason(self, dedupe, event, window):
-        reason = self._try_push(dedupe, event, window)
-        return Result(accepted=reason is None, reason=reason)
+        reason, discarded = self._try_push(dedupe, event, window)
+        return self._push_result(reason, discarded)
 
     def push_expiring(self, dedupe, event, window, event_ttl):
-        return self._try_push_expiring(dedupe, event, window, event_ttl) is None
+        return self._try_push_expiring(dedupe, event, window, event_ttl)[0] is None
 
     def push_expiring_with_reason(self, dedupe, event, window, event_ttl):
-        reason = self._try_push_expiring(dedupe, event, window, event_ttl)
-        return Result(accepted=reason is None, reason=reason)
+        reason, discarded = self._try_push_expiring(dedupe, event, window, event_ttl)
+        return self._push_result(reason, discarded)
 
     def _try_push_expiring(self, dedupe, event, window, event_ttl):
         # event_ttl 为必选时长：None 等非法值同样在校验阶段抛出 ValueError，
@@ -542,8 +592,8 @@ class EventCache:
             now = self.clock()
             for dedupe, event, window, event_ttl in entries:
                 # 前项已立即更新 seen 与队列占用，后项据此继续判定
-                reason = self._try_push_at(dedupe, event, window, now, event_ttl)
-                results.append(Result(accepted=reason is None, reason=reason))
+                reason, discarded = self._try_push_at(dedupe, event, window, now, event_ttl)
+                results.append(self._push_result(reason, discarded))
         return results
 
     def apply_batch(self, operations):
@@ -565,12 +615,13 @@ class EventCache:
                 elif tag == 'push':
                     _, dedupe, event, window = op
                     # 前序操作（含 cleanup）已立即更新状态，本项据此在同一时刻判定
-                    reason = self._try_push_at(dedupe, event, window, now)
-                    results.append(Result(accepted=reason is None, reason=reason))
+                    reason, discarded = self._try_push_at(dedupe, event, window, now)
+                    results.append(self._push_result(reason, discarded))
                 elif tag == 'push_expiring':
                     _, dedupe, event, window, event_ttl = op
-                    reason = self._try_push_at(dedupe, event, window, now, event_ttl)
-                    results.append(Result(accepted=reason is None, reason=reason))
+                    reason, discarded = \
+                        self._try_push_at(dedupe, event, window, now, event_ttl)
+                    results.append(self._push_result(reason, discarded))
                 elif tag == 'cleanup':
                     values_removed, dedupe_removed = self._cleanup_at(now)
                     results.append(Result(
@@ -630,7 +681,9 @@ class EventCache:
         时整批拒绝，缓存保持原样；key/dedupe 不可哈希时原样抛出
         TypeError。空记录返回空列表且不读取时钟。成功时返回与输入逐项
         对应、形状与各公开操作一致的结果列表：put 为 accepted/reason，
-        push 类仅 accepted 与 reason（None/dedupe_window/queue_full），
+        push 类为 accepted 与 reason（None/dedupe_window/queue_full），
+        drop_oldest 策略下再附 discarded 列表（被挤出队首时为
+        [Result(event=原事件, reason='queue_full')]，否则为空），
         delete 为 deleted，cleanup 为 values_removed/dedupe_removed，
         cleanup_expired_events 为 events_removed，discard_expired_events
         为 events_removed/discarded（形状与公开方法一致），
@@ -657,12 +710,13 @@ class EventCache:
             elif tag == 'push':
                 _, dedupe, event, window = op
                 # 前序记录已立即更新状态，本记录按其自带时刻判定
-                reason = self._try_push_at(dedupe, event, window, now)
-                results.append(Result(accepted=reason is None, reason=reason))
+                reason, discarded = self._try_push_at(dedupe, event, window, now)
+                results.append(self._push_result(reason, discarded))
             elif tag == 'push_expiring':
                 _, dedupe, event, window, event_ttl = op
-                reason = self._try_push_at(dedupe, event, window, now, event_ttl)
-                results.append(Result(accepted=reason is None, reason=reason))
+                reason, discarded = \
+                    self._try_push_at(dedupe, event, window, now, event_ttl)
+                results.append(self._push_result(reason, discarded))
             elif tag == 'cleanup':
                 values_removed, dedupe_removed = self._cleanup_at(now)
                 results.append(Result(
@@ -858,7 +912,9 @@ class EventCache:
         记录与未出队事件一律原样保留。队列中没有带 TTL 事件时返回只含
         values、events、seen、max_queue 四个字段的 Result；存在带 TTL 事件时
         增加与 events 对齐的 event_expiries 字段，无 TTL 的旧事件以 None
-        表示。外层字典与事件列表均为与缓存分离的副本，随后任一方增删都不会
+        表示。默认 reject_new 策略沿用旧快照形状（不带 overflow_policy），
+        仅 drop_oldest 策略额外保存 overflow_policy，以保持旧格式兼容。
+        外层字典与事件列表均为与缓存分离的副本，随后任一方增删都不会
         影响另一方；value 与事件对象按既有接口语义保留引用。
         """
         snap = Snapshot(
@@ -867,6 +923,9 @@ class EventCache:
             seen=dict(self.seen),
             max_queue=self.max_queue,
         )
+        if self.overflow_policy != _REJECT_NEW:
+            # 非默认策略才入快照；默认策略的快照仍保持旧四/五字段形状
+            snap['overflow_policy'] = self.overflow_policy
         if any(expiry is not None for expiry in self.event_expiries):
             snap['event_expiries'] = list(self.event_expiries)
         return snap
@@ -875,16 +934,20 @@ class EventCache:
         """从快照一次性恢复 values、events、seen、max_queue（及事件到期信息）。
 
         先完整解析并校验快照：在此之前不读取时钟、不改变任何状态，校验失败时
-        原状态、队列顺序和容量完全保持。接受不含 event_expiries 的旧格式
-        （恢复后所有事件均无 TTL）与含 event_expiries 的新格式。成功后以副本
-        整体替换状态并返回 None，恢复出的容器与传入快照相互独立。恢复后一律
-        由本实例当前时间源按既有的 expiry <= now 边界判定过期，不隐式清理、
-        不释放队列槽位、不延长去重窗口。
+        原状态、队列顺序、容量与溢出策略完全保持。接受不含 event_expiries 的
+        旧格式（恢复后所有事件均无 TTL）与含 event_expiries 的新格式；不含
+        overflow_policy 的旧四/五字段快照按默认 'reject_new' 策略解释，含该
+        字段时恢复对应策略。成功后以副本整体替换状态并返回 None，恢复出的
+        容器与传入快照相互独立。恢复后一律由本实例当前时间源按既有的
+        expiry <= now 边界判定过期，不隐式清理、不释放队列槽位、不延长去重
+        窗口。
         """
-        values, events, event_expiries, seen, max_queue = _parse_snapshot(snapshot)
+        values, events, event_expiries, seen, max_queue, overflow_policy = \
+            _parse_snapshot(snapshot)
         self.values = values
         self.events = events
         self.event_expiries = event_expiries
         self.seen = seen
         self.max_queue = max_queue
+        self.overflow_policy = overflow_policy
         return None
