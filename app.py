@@ -422,6 +422,54 @@ class EventCache:
             self.event_expiries.popleft()
         return taken
 
+    def pop_live_batch(self, limit=None):
+        """过期感知的批量出队：一次时钟判断同时给出有效事件与被丢弃事件。
+
+        按当前队列的插入顺序从队头扫描：未设置 event_ttl 的事件始终可消费，
+        原样放入 events；设置了 event_ttl 且绝对到期点 <= 本次读取时刻的事件
+        从队列移除，并在 discarded 中按原顺序追加
+        Result(event=原事件值, reason='event_ttl')。过期项位于队头或队中都不
+        改变其余事件的相对顺序。整次调用只读取一次注入时钟。
+
+        limit 为 None（缺省）时处理整个队列；为正整数时在取到该数量的有效
+        事件后立即停止扫描，其后的事件（含恰好已到期者）一律不检查、不出队，
+        仍占用原 max_queue 槽位；为 0 时不读取时钟也不改变状态，直接返回两个
+        空列表。队列为空时同样不读取时钟。被移除的过期事件与返回的有效事件
+        一样释放队列槽位，但两者都不触碰 values 与 seen：过期事件的去重记录
+        保留到原去重窗口截止，下一次相同去重键继续遵循既有判定。
+
+        limit 不是 None 且不是非 bool 的非负整数（负数、浮点数、字符串、
+        布尔值等）时抛出 ValueError，抛出前不读取时钟、不改变任何状态；时钟
+        抛出的异常原样传播。返回 Result(events=有效事件列表,
+        discarded=丢弃结果列表)，两者均为普通 list。
+        """
+        if limit is not None:
+            # bool 是 int 的子类，必须显式排除；浮点数（含 2.0）同样拒绝
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError('limit must be None or a non-negative integer')
+            if limit == 0:
+                # 显式零配额：不读时钟、不扫描、不改状态
+                return Result(events=[], discarded=[])
+        if not self.events:
+            # 空队列不读取时钟
+            return Result(events=[], discarded=[])
+        now = self.clock()
+        events = []
+        discarded = []
+        # 从队头逐项判定：有效事件与过期事件都已出列，停止扫描后剩余元素
+        # 自然保持原序留在 deque 中，槽位不被提前释放
+        while self.events:
+            event = self.events.popleft()
+            expiry = self.event_expiries.popleft()
+            if expiry is not None and expiry <= now:
+                # 到期边界与 values/seen/cleanup_expired_events 一致：<= 即过期
+                discarded.append(Result(event=event, reason='event_ttl'))
+            else:
+                events.append(event)
+                if limit is not None and len(events) >= limit:
+                    break
+        return Result(events=events, discarded=discarded)
+
     def queue_status(self):
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
