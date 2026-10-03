@@ -1129,6 +1129,336 @@ class PopLiveBatchTest(unittest.TestCase):
         self.assertEqual(r.discarded, [])
 
 
+class PeekTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 基本结果形状与顺序 ----
+    def test_default_limit_returns_all_in_fifo_order(self):
+        self.cache.push('d1', 'a', 100)
+        self.cache.push('d2', 'b', 100)
+        self.cache.push('d3', 'c', 100)
+        self.assertEqual(self.cache.peek(), ['a', 'b', 'c'])
+        self.assertEqual(self.cache.queue_status().size, 3)  # 不出队
+
+    def test_explicit_none_limit_returns_all(self):
+        self.cache.push('d1', 'a', 100)
+        self.cache.push('d2', 'b', 100)
+        self.assertEqual(self.cache.peek(None), ['a', 'b'])
+
+    def test_zero_limit_returns_empty_and_removes_nothing(self):
+        self.cache.push('d1', 'a', 100)
+        self.assertEqual(self.cache.peek(0), [])
+        self.assertEqual(self.cache.queue_status().size, 1)
+
+    def test_limit_smaller_than_size_returns_prefix_only(self):
+        for i in range(4):
+            self.cache.push('d%d' % i, 'e%d' % i, 100)
+        self.assertEqual(self.cache.peek(2), ['e0', 'e1'])
+        self.assertEqual(self.cache.queue_status().size, 4)
+
+    def test_limit_larger_than_size_returns_all_without_error(self):
+        self.cache.push('d1', 'a', 100)
+        self.assertEqual(self.cache.peek(10), ['a'])
+
+    def test_empty_queue_returns_empty(self):
+        self.assertEqual(self.cache.peek(), [])
+        self.assertEqual(self.cache.peek(3), [])
+
+    def test_returns_plain_list_of_original_references(self):
+        event = {'payload': 1}
+        self.cache.push('d1', None, 100)
+        self.cache.push('d2', event, 100)
+        result = self.cache.peek()
+        self.assertIsInstance(result, list)
+        self.assertIsNone(result[0])  # None 是合法事件，原样保留
+        self.assertIs(result[1], event)  # 按原引用返回，不复制
+
+    def test_repeated_peek_is_stable_and_pop_sees_same_head(self):
+        self.cache.push('d1', 'a', 100)
+        self.cache.push('d2', 'b', 100)
+        self.assertEqual(self.cache.peek(), self.cache.peek())
+        self.assertEqual(self.cache.pop(), 'a')  # peek 不消费队头
+        self.assertEqual(self.cache.peek(), ['b'])
+
+    # ---- 纯查询：不读时钟、不触碰其他状态 ----
+    def test_does_not_read_clock_even_when_empty_or_zero_limit(self):
+        self.cache.peek()
+        self.cache.peek(0)
+        self.cache.push('d1', 'a', 100)
+        self.clock_calls[0] = 0
+        self.cache.peek()
+        self.cache.peek(0)
+        self.cache.peek(1)
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_does_not_touch_expiries_values_seen_or_capacity(self):
+        cache = EventCache(self.clock, max_queue=2)
+        cache.put('k', 'v', 100)
+        cache.push_expiring('d1', 'x', 100, 1)
+        cache.push('d2', 'a', 100)
+        self.advance(10)  # 事件已到期：peek 不做过期判断，原样返回
+        seen_before = dict(cache.seen)
+        self.assertEqual(cache.peek(), ['x', 'a'])
+        self.assertEqual(list(cache.event_expiries), [101, None])
+        self.assertEqual(cache.values['k'], ('v', 200))
+        self.assertEqual(cache.seen, seen_before)
+        self.assertEqual(cache.queue_status().size, 2)
+        # 槽位不释放：队列仍满
+        self.assertEqual(cache.push_with_reason('d3', 'c', 100).reason, 'queue_full')
+
+    # ---- limit 校验原子性 ----
+    def test_invalid_limit_raises_and_changes_nothing(self):
+        self.cache.push('d1', 'a', 100)
+        self.clock_calls[0] = 0
+        for bad in (-1, -100, 1.5, 2.0, '3', [3], object(), True, False):
+            with self.assertRaises(ValueError):
+                self.cache.peek(bad)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(list(self.cache.events), ['a'])
+
+    def test_plain_int_limit_accepted(self):
+        self.cache.push('d1', 'a', 100)
+        self.cache.push('d2', 'b', 100)
+        self.assertEqual(self.cache.peek(1), ['a'])
+
+
+class PeekLiveBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue):
+        return EventCache(self.clock, max_queue=max_queue)
+
+    # ---- 基本结果形状 ----
+    def test_returns_result_with_two_lists(self):
+        self.cache.push('d1', 'e1', 100)
+        r = self.cache.peek_live_batch()
+        self.assertIsInstance(r, Result)
+        self.assertIsInstance(r.events, list)
+        self.assertIsInstance(r.discarded, list)
+        self.assertEqual(r['events'], ['e1'])
+        self.assertEqual(r.discarded, [])
+
+    def test_empty_queue_reads_no_clock_and_returns_empty_lists(self):
+        r = self.cache.peek_live_batch()
+        self.assertEqual((r.events, r.discarded), ([], []))
+        self.assertEqual(self.clock_calls[0], 0)
+        r = self.cache.peek_live_batch(None)
+        self.assertEqual((r.events, r.discarded), ([], []))
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_zero_limit_reads_no_clock_even_on_nonempty_queue(self):
+        self.cache.push_expiring('d1', 'e1', 100, 0)
+        self.advance(50)
+        self.clock_calls[0] = 0
+        r = self.cache.peek_live_batch(0)
+        self.assertEqual((r.events, r.discarded), ([], []))
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(self.cache.queue_status().size, 1)  # 状态不变
+
+    def test_reads_clock_exactly_once(self):
+        self.cache.push_expiring('d1', 'e1', 100, 5)
+        self.cache.push('d2', 'e2', 100)
+        self.cache.push_expiring('d3', 'e3', 100, 500)
+        self.clock_calls[0] = 0
+        self.cache.peek_live_batch()
+        self.assertEqual(self.clock_calls[0], 1)
+        self.cache.peek_live_batch(2)
+        self.assertEqual(self.clock_calls[0], 2)  # 队列未消费，再次扫描仍读一次
+
+    # ---- 与 pop_live_batch 一致的 TTL 判定与边界 ----
+    def test_plain_events_always_live_even_when_clock_far_ahead(self):
+        self.cache.push('d1', 'e1', 0)
+        self.cache.push('d2', 'e2', 0)
+        self.advance(10000)
+        r = self.cache.peek_live_batch()
+        self.assertEqual(r.events, ['e1', 'e2'])
+        self.assertEqual(r.discarded, [])
+
+    def test_none_event_is_a_live_element(self):
+        self.cache.push('d1', None, 100)
+        r = self.cache.peek_live_batch()
+        self.assertEqual(r.events, [None])
+        self.assertEqual(r.discarded, [])
+
+    def test_expired_events_are_discarded_in_original_order(self):
+        self.cache.push_expiring('d1', 'e1', 100, 5)    # 到期点 105
+        self.cache.push('d2', 'e2', 100)                # 无 TTL
+        self.cache.push_expiring('d3', 'e3', 100, 500)  # 到期点 600
+        self.advance(10)  # 当前 110
+        r = self.cache.peek_live_batch()
+        self.assertEqual(r.events, ['e2', 'e3'])  # 相对顺序保留
+        self.assertEqual(len(r.discarded), 1)
+        d = r.discarded[0]
+        self.assertIsInstance(d, Result)
+        self.assertEqual(d.event, 'e1')
+        self.assertEqual(d['event'], 'e1')
+        self.assertEqual(d.reason, 'event_ttl')
+
+    def test_boundary_expiry_equal_to_now_is_discarded(self):
+        self.cache.push_expiring('dlive', 'live-soon', 100, 5)  # 到期点 105
+        self.advance(4)  # 当前 104
+        r = self.cache.peek_live_batch()
+        self.assertEqual(r.events, ['live-soon'])  # 104 < 105 仍有效
+        self.assertEqual(r.discarded, [])
+        self.advance(1)  # 当前恰为 105：到期点 <= 当前时刻
+        r = self.cache.peek_live_batch()
+        self.assertEqual(r.events, [])
+        self.assertEqual([d.event for d in r.discarded], ['live-soon'])
+
+    def test_zero_event_ttl_discarded_immediately(self):
+        self.cache.push_expiring('d', 'e', 100, 0)  # 接受时即到期
+        r = self.cache.peek_live_batch()
+        self.assertEqual(r.events, [])
+        self.assertEqual([d.event for d in r.discarded], ['e'])
+
+    def test_preview_matches_pop_live_batch_on_twin_cache(self):
+        # 同样的队列在同样的时刻：预览结果与真实出队结果一致
+        twin = self.make(None)
+        for source in (self.cache, twin):
+            source.push_expiring('d1', 'x1', 100, 1)
+            source.push('d2', 'a', 100)
+            source.push_expiring('d3', 'x2', 100, 1)
+        self.advance(10)
+        preview = self.cache.peek_live_batch()
+        outcome = twin.pop_live_batch()
+        self.assertEqual(preview.events, outcome.events)
+        self.assertEqual([d.event for d in preview.discarded],
+                         [d.event for d in outcome.discarded])
+
+    # ---- limit 正整数：达到有效数量即停止扫描 ----
+    def test_positive_limit_stops_after_enough_live_events(self):
+        self.cache.push_expiring('d1', 'x1', 100, 1)  # 过期，先被扫描
+        self.cache.push_expiring('d2', 'a', 100, 500)  # 有效 #1
+        self.cache.push_expiring('d3', 'x2', 100, 1)  # 过期，但不再扫描
+        self.cache.push_expiring('d4', 'b', 100, 500)  # 不扫描
+        self.advance(10)
+        r = self.cache.peek_live_batch(1)
+        self.assertEqual(r.events, ['a'])
+        self.assertEqual([d.event for d in r.discarded], ['x1'])
+        # 未扫描的尾部与全部队列一样原状保留
+        self.assertEqual(list(self.cache.events), ['x1', 'a', 'x2', 'b'])
+
+    def test_limit_counts_only_live_events(self):
+        self.cache.push_expiring('d1', 'x1', 100, 1)
+        self.cache.push_expiring('d2', 'x2', 100, 1)
+        self.cache.push('d3', 'a', 100)
+        self.cache.push('d4', 'b', 100)
+        self.advance(10)
+        r = self.cache.peek_live_batch(2)
+        self.assertEqual(r.events, ['a', 'b'])
+        self.assertEqual([d.event for d in r.discarded], ['x1', 'x2'])
+
+    def test_limit_larger_than_live_count_scans_all(self):
+        self.cache.push_expiring('d1', 'x', 100, 1)
+        self.cache.push('d2', 'a', 100)
+        self.advance(10)
+        r = self.cache.peek_live_batch(10)
+        self.assertEqual(r.events, ['a'])
+        self.assertEqual([d.event for d in r.discarded], ['x'])
+
+    # ---- 非破坏性：队列、容量、values、seen 一律不变 ----
+    def test_does_not_remove_events_or_free_slots(self):
+        cache = self.make(2)
+        cache.push_expiring('d1', 'x', 100, 1)
+        cache.push('d2', 'a', 100)
+        self.advance(10)
+        r = cache.peek_live_batch()
+        self.assertEqual((r.events, [d.event for d in r.discarded]), (['a'], ['x']))
+        self.assertEqual(list(cache.events), ['x', 'a'])  # 顺序与内容不变
+        self.assertEqual(list(cache.event_expiries), [101, None])
+        self.assertEqual(cache.queue_status().size, 2)
+        # 过期事件的槽位不释放：队列仍满
+        self.assertEqual(cache.push_with_reason('d3', 'b', 100).reason, 'queue_full')
+        # 随后 pop_live_batch 仍按相同判定出队：预览没有改变任何结果
+        outcome = cache.pop_live_batch()
+        self.assertEqual(outcome.events, ['a'])
+        self.assertEqual([d.event for d in outcome.discarded], ['x'])
+        self.assertEqual(cache.queue_status().size, 0)
+
+    def test_does_not_touch_values_or_seen(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.put('gone', 'g', 1)
+        self.cache.push_expiring('d1', 'x', 100, 1)
+        self.cache.push('d2', 'a', 100)
+        seen_before = dict(self.cache.seen)
+        self.advance(10)
+        self.cache.peek_live_batch()
+        self.assertEqual(self.cache.values['k'], ('v', 200))
+        self.assertIn('gone', self.cache.values)  # 过期 value 不被顺带清理
+        self.assertEqual(self.cache.seen, seen_before)  # 去重记录一律保留
+
+    def test_repeated_peek_is_idempotent(self):
+        self.cache.push_expiring('d1', 'x', 100, 1)
+        self.cache.push('d2', 'a', 100)
+        self.advance(10)
+        r1 = self.cache.peek_live_batch()
+        r2 = self.cache.peek_live_batch()
+        self.assertEqual(r1.events, r2.events)
+        self.assertEqual([d.event for d in r1.discarded],
+                         [d.event for d in r2.discarded])
+
+    # ---- limit 校验原子性 ----
+    def test_invalid_limit_raises_without_clock_or_state_change(self):
+        self.cache.push_expiring('d1', 'x', 100, 0)
+        self.cache.push('d2', 'a', 100)
+        self.advance(10)
+        self.clock_calls[0] = 0
+        for bad in (-1, -100, 1.5, 2.0, '3', [3], object(), True, False):
+            with self.assertRaises(ValueError):
+                self.cache.peek_live_batch(bad)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(list(self.cache.events), ['x', 'a'])
+        self.assertEqual(list(self.cache.event_expiries), [100, None])
+
+    # ---- 时钟异常原样传播 ----
+    def test_clock_exception_propagates_without_state_change(self):
+        def bad_clock():
+            raise RuntimeError('clock broken')
+
+        cache = EventCache(bad_clock)
+        # restore 不读取时钟，借此装入初始队列
+        cache.restore({'values': {}, 'events': ['e1', 'e2'], 'seen': {}, 'max_queue': None})
+        with self.assertRaises(RuntimeError):
+            cache.peek_live_batch()
+        self.assertEqual(list(cache.events), ['e1', 'e2'])  # 状态完整保持
+
+    # ---- 与快照恢复协作 ----
+    def test_restored_expiries_drive_peek_live_batch(self):
+        seed = EventCache(lambda: 100)
+        seed.push_expiring('d1', 'x', 100, 5)
+        seed.push('d2', 'a', 100)
+        target = EventCache(lambda: 110)
+        target.restore(seed.snapshot())
+        r = target.peek_live_batch()
+        self.assertEqual(r.events, ['a'])
+        self.assertEqual([d.event for d in r.discarded], ['x'])
+        self.assertEqual(target.queue_status().size, 2)  # 预览不出队
+
+
 class SnapshotTest(unittest.TestCase):
     def setUp(self):
         self.now = [100]
