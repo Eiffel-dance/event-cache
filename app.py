@@ -114,7 +114,8 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
 
     操作必须是带标签的元组：('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
-    ('push_expiring', dedupe, event, window, event_ttl) 或 ('cleanup',)；
+    ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)
+    或 ('cleanup_all_expired',)；
     allow_event_cleanup 为真时额外接受 ('cleanup_expired_events',)；
     allow_reads 为真时再接受读取与出队路径的记录：('get', key)、
     ('pop',)、('pop_batch',)、('pop_batch', limit)、('peek',)、
@@ -161,6 +162,11 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         if len(item) != 1:
             raise ValueError("'cleanup' operation must be ('cleanup',)")
         return ('cleanup',)
+    if tag == 'cleanup_all_expired':
+        if len(item) != 1:
+            raise ValueError(
+                "'cleanup_all_expired' operation must be ('cleanup_all_expired',)")
+        return ('cleanup_all_expired',)
     if tag == 'cleanup_expired_events' and allow_event_cleanup:
         if len(item) != 1:
             raise ValueError(
@@ -200,7 +206,8 @@ def _parse_apply_batch(batch):
     批次必须可迭代，每项为带标签的元组：
     ('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
-    ('push_expiring', dedupe, event, window, event_ttl) 或 ('cleanup',)。
+    ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)
+    或 ('cleanup_all_expired',)。
     批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window/
     event_ttl 非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为
     缓存索引时抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
@@ -218,8 +225,8 @@ def _parse_replay_batch(records):
     records 必须可迭代，每项为 (timestamp, operation) 二元结构：timestamp
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
-    apply_batch 的 put/delete/push/push_expiring/cleanup 与
-    ('cleanup_expired_events',) 外，还接受读取与出队路径的
+    apply_batch 的 put/delete/push/push_expiring/cleanup/
+    cleanup_all_expired 与 ('cleanup_expired_events',) 外，还接受读取与出队路径的
     ('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
     ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数。
@@ -410,6 +417,35 @@ class EventCache:
         now = self.clock()
         return Result(events_removed=self._cleanup_events_at(now))
 
+    def _cleanup_all_at(self, now):
+        # 在指定时刻一次性清理三类过期记录：值、去重记录与带 TTL 事件。
+        # 三者互不触碰：事件清理不删除 seen 去重窗口，值清理不触碰队列。
+        values_removed, dedupe_removed = self._cleanup_at(now)
+        events_removed = self._cleanup_events_at(now)
+        return values_removed, dedupe_removed, events_removed
+
+    def cleanup_all_expired(self):
+        """单次读取时钟，一次性清理全部过期状态。
+
+        在本次读取时刻同时移除：到期点 <= 当前时刻的 values 记录、seen 去重
+        记录，以及带 event_ttl 且已到期的队列事件。事件无论位于队首、队中
+        还是队尾都按原 FIFO 位置移除，剩余事件相对顺序不变，释放的队列容量
+        可被后续 push 使用；清理事件不删除或延长对应的 seen 去重窗口，清理
+        values 也不触碰队列。max_queue 不受影响。
+
+        整次调用只读取一次注入时钟；没有可清理项时返回三个零。时钟抛出的
+        异常原样传播，且时尚未改动任何状态。重复调用对已清理的记录返回零
+        计数。返回 Result(values_removed=…, dedupe_removed=…,
+        events_removed=…)，计数反映本次调用实际删除的记录数。
+        """
+        now = self.clock()
+        values_removed, dedupe_removed, events_removed = self._cleanup_all_at(now)
+        return Result(
+            values_removed=values_removed,
+            dedupe_removed=dedupe_removed,
+            events_removed=events_removed,
+        )
+
     def _try_push_at(self, dedupe, event, window, now, event_ttl=None):
         # 在指定时钟时刻判定一次入队：window/event_ttl 由调用方先行校验
         expiry = self.seen.get(dedupe)
@@ -491,11 +527,19 @@ class EventCache:
                     _, dedupe, event, window, event_ttl = op
                     reason = self._try_push_at(dedupe, event, window, now, event_ttl)
                     results.append(Result(accepted=reason is None, reason=reason))
-                else:  # 'cleanup'
+                elif tag == 'cleanup':
                     values_removed, dedupe_removed = self._cleanup_at(now)
                     results.append(Result(
                         values_removed=values_removed,
                         dedupe_removed=dedupe_removed,
+                    ))
+                else:  # 'cleanup_all_expired'
+                    values_removed, dedupe_removed, events_removed = \
+                        self._cleanup_all_at(now)
+                    results.append(Result(
+                        values_removed=values_removed,
+                        dedupe_removed=dedupe_removed,
+                        events_removed=events_removed,
                     ))
         return results
 
@@ -504,7 +548,7 @@ class EventCache:
 
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
-        put/delete/push/push_expiring/cleanup 与
+        put/delete/push/push_expiring/cleanup/cleanup_all_expired 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
         ('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
         ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
@@ -535,7 +579,8 @@ class EventCache:
         对应、形状与各公开操作一致的结果列表：put 为 accepted/reason，
         push 类仅 accepted 与 reason（None/dedupe_window/queue_full），
         delete 为 deleted，cleanup 为 values_removed/dedupe_removed，
-        cleanup_expired_events 为 events_removed，get/pop 为单个值，
+        cleanup_expired_events 为 events_removed，cleanup_all_expired
+        为 values_removed/dedupe_removed/events_removed，get/pop 为单个值，
         pop_batch/peek 为普通 list，pop_live_batch/peek_live_batch 为含
         events/discarded 两个 list 的 Result，queue_status 为含
         size/max_queue 的 Result。回放写入的绝对到期时间与常规路径一致，
@@ -571,6 +616,14 @@ class EventCache:
                 ))
             elif tag == 'cleanup_expired_events':
                 results.append(Result(events_removed=self._cleanup_events_at(now)))
+            elif tag == 'cleanup_all_expired':
+                values_removed, dedupe_removed, events_removed = \
+                    self._cleanup_all_at(now)
+                results.append(Result(
+                    values_removed=values_removed,
+                    dedupe_removed=dedupe_removed,
+                    events_removed=events_removed,
+                ))
             elif tag == 'get':
                 _, key = op
                 # 按记录时刻判定键值 TTL：到期点 <= 记录时刻即移除并返回 None
