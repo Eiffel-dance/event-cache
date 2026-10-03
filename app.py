@@ -46,6 +46,18 @@ def _check_duration(value, name):
         raise ValueError('%s must be a finite non-negative number' % name)
 
 
+def _check_expiry(value, name):
+    """快照中的绝对到期时刻必须是非 bool 的有限 int/float。
+
+    与 _check_duration 不同：这是绝对时刻而非相对时长，允许负数与任何
+    已过期的取值；NaN、正负无穷、字符串、复合对象等一律拒绝。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError('%s must be a finite expiry time' % name)
+    if not math.isfinite(value):
+        raise ValueError('%s must be a finite expiry time' % name)
+
+
 def _check_max_queue(value):
     """max_queue 必须是 None 或非负整数，布尔值不视为有效上限。"""
     if value is None:
@@ -180,10 +192,12 @@ def _parse_snapshot(snapshot):
     for key, item in raw_values.items():
         if not isinstance(item, tuple) or len(item) != 2:
             raise ValueError('each values entry must be a (value, expires_at) pair')
+        _check_expiry(item[1], 'values expires_at')
         hash(key)  # 不可哈希时原样抛出 TypeError
         values[key] = item
     seen = {}
     for key, expiry in raw_seen.items():
+        _check_expiry(expiry, 'seen expiry')
         hash(key)  # 不可哈希时原样抛出 TypeError
         seen[key] = expiry
     # list() 物化事件副本；值与事件对象按既有语义保留引用
