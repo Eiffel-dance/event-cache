@@ -46,6 +46,18 @@ def _check_duration(value, name):
         raise ValueError('%s must be a finite non-negative number' % name)
 
 
+def _check_expiry(value, name):
+    """绝对到期时刻必须是非 bool 的有限 int/float。
+
+    与 _check_duration 不同：到期时刻是时间轴上的绝对点，允许负数和
+    早于当前时刻的值（恢复后按既有边界立即视为过期），不解释为相对时长。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError('%s must be a finite number' % name)
+    if not math.isfinite(value):
+        raise ValueError('%s must be a finite number' % name)
+
+
 def _check_max_queue(value):
     """max_queue 必须是 None 或非负整数，布尔值不视为有效上限。"""
     if value is None:
@@ -154,9 +166,12 @@ def _parse_snapshot(snapshot):
     key -> (value, expires_at) 的映射，seen 为去重键 -> 绝对到期时间的
     映射，events 为事件列表（按 FIFO 顺序），max_queue 为 None 或非负
     整数，event_expiries 为与 events 等长的列表，每项为 None（无事件
-    TTL）或有限的绝对到期时刻。字段缺失或多余、非映射/列表容器、二元组
-    结构不符、event_expiries 长度不一致或含无效到期信息、max_queue 非法
-    时统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
+    TTL）或有限的绝对到期时刻。三类到期时间（values 的 expires_at、seen
+    的到期时刻、event_expiries 的非 None 项）都只能是非 bool 的有限
+    int/float，允许负数与已过期时刻，不解释为相对时长。字段缺失或多余、
+    非映射/列表容器、二元组结构不符、event_expiries 长度不一致或任一
+    到期值为 NaN/无穷/字符串/复合对象、max_queue 非法时统一抛出
+    ValueError；键不可哈希时原样抛出 TypeError。
     校验期间一次性物化为全新的 dict/list/deque，供调用方随后整体替换状态。
     """
     if not isinstance(snapshot, Mapping):
@@ -181,10 +196,12 @@ def _parse_snapshot(snapshot):
         if not isinstance(item, tuple) or len(item) != 2:
             raise ValueError('each values entry must be a (value, expires_at) pair')
         hash(key)  # 不可哈希时原样抛出 TypeError
+        _check_expiry(item[1], 'expires_at')
         values[key] = item
     seen = {}
     for key, expiry in raw_seen.items():
         hash(key)  # 不可哈希时原样抛出 TypeError
+        _check_expiry(expiry, 'seen expiry')
         seen[key] = expiry
     # list() 物化事件副本；值与事件对象按既有语义保留引用
     events = deque(raw_events)
@@ -196,12 +213,8 @@ def _parse_snapshot(snapshot):
             raise ValueError('snapshot event_expiries must align with events in length')
         event_expiries = deque()
         for expiry in raw_expiries:
-            if expiry is not None and (
-                isinstance(expiry, bool)
-                or not isinstance(expiry, (int, float))
-                or not math.isfinite(expiry)
-            ):
-                raise ValueError('each event_expiries entry must be None or a finite expiry time')
+            if expiry is not None:
+                _check_expiry(expiry, 'event_expiries entry')
             event_expiries.append(expiry)
     else:
         # 旧格式快照：所有事件均无 TTL
