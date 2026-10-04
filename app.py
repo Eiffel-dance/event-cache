@@ -128,7 +128,8 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     allow_event_cleanup 为真时额外接受
     ('cleanup_expired_events',)；
     allow_reads 为真时再接受读取与出队路径的记录：('get', key)、
-    ('pop',)、('pop_batch',)、('pop_batch', limit)、('peek',)、
+    ('get_with_reason', key)、('pop',)、('pop_batch',)、('pop_batch', limit)、
+    ('peek',)、
     ('peek', limit)、('pop_live_batch',)、('pop_live_batch', limit)、
     ('peek_live_batch',)、('peek_live_batch', limit) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数。
@@ -194,6 +195,13 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
             _, key = item
             hash(key)
             return ('get', key)
+        if tag == 'get_with_reason':
+            if len(item) != 2:
+                raise ValueError(
+                    "'get_with_reason' operation must be ('get_with_reason', key)")
+            _, key = item
+            hash(key)
+            return ('get_with_reason', key)
         if tag == 'pop':
             if len(item) != 1:
                 raise ValueError("'pop' operation must be ('pop',)")
@@ -243,7 +251,8 @@ def _parse_replay_batch(records):
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/delete/push/push_expiring/cleanup/
     cleanup_all_expired/discard_expired_events 与
-    ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
+    ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
+    ('get_with_reason', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
     ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数。
     records 不可迭代、记录不是二元结构、时间戳非法或倒退、操作结构/标签/
@@ -384,6 +393,39 @@ class EventCache:
         if item is None:
             return None
         return self._get_at(key, self.clock())
+
+    def _get_with_reason_at(self, key, now):
+        # 在指定时刻给出带原因的读取结果；过期判定与 _get_at 共用 <= 边界，
+        # 过期记录同样只移除该键。回放路径直接以记录时刻调用本方法。
+        item = self.values.get(key)
+        if item is None:
+            return Result(found=False, value=None, reason='missing')
+        value, expiry = item
+        if expiry <= now:
+            self.values.pop(key, None)
+            return Result(found=False, value=None, reason='expired')
+        # 原值为 None、False 或其他假值也按 found=True 原样返回
+        return Result(found=True, value=value, reason=None)
+
+    def get_with_reason(self, key):
+        """带诊断原因的读取入口，区分 missing / expired / 命中三种结果。
+
+        键不存在时返回 Result(found=False, value=None, reason='missing')，
+        与 get 一样不读取注入时钟；键存在时只读取一次注入时钟，以
+        expires_at <= now 为过期边界：过期记录从 values 中移除（只移除该键，
+        不触发批量清理）并返回 Result(found=False, value=None,
+        reason='expired')，未过期记录返回 Result(found=True, value=原值,
+        reason=None)，原值为 None、False 或其他假值同样按命中返回。
+
+        纯单键诊断：不触碰 seen、events、event_expiries 与 max_queue，也不
+        触发 values/seen 的批量清理；过期键被移除后，后续相同读取按
+        missing 返回。key 不可哈希时成员判定原样抛出 TypeError，时钟抛出的
+        异常原样传播，两种情况下缓存状态均保持不变。
+        """
+        item = self.values.get(key)
+        if item is None:
+            return Result(found=False, value=None, reason='missing')
+        return self._get_with_reason_at(key, self.clock())
 
     def delete(self, key):
         # 结果只表达键是否存在，与取出的值无关：value 为 None、False、0、''
@@ -648,7 +690,8 @@ class EventCache:
         put/delete/push/push_expiring/cleanup/cleanup_all_expired/
         discard_expired_events 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
-        ('get', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
+        ('get', key)、('get_with_reason', key)、('pop',)、
+        ('pop_batch'[, limit])、('peek'[, limit])、
         ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
         ('queue_status',)。每条记录以自己的 timestamp 作为当前时刻计算
         TTL、event_ttl 与去重窗口的绝对边界，同一时间戳共享该边界；回放
@@ -657,7 +700,11 @@ class EventCache:
 
         读取与出队记录的时间语义与对应公开入口一致：get 按记录时刻判定
         键值 TTL，到期点 <= 记录时刻时返回 None 并移除该键（键不存在同样
-        返回 None）；pop 与 pop_batch 不读取时间，即使事件已到期也按 FIFO
+        返回 None）；get_with_reason 以同一记录时刻与 <= 边界给出诊断结果：
+        键不存在为 Result(found=False, value=None, reason='missing')，
+        已到期为 Result(found=False, value=None, reason='expired') 并移除
+        该键，未到期为 Result(found=True, value=原值, reason=None)，原值为
+        None、False 或其他假值同样按命中返回；pop 与 pop_batch 不读取时间，即使事件已到期也按 FIFO
         原样取出，空队列分别返回 None 与 []；peek 只观察前缀、queue_status
         只报告 size/max_queue，二者都不改变任何状态；pop_live_batch 与
         peek_live_batch 按记录时刻扫描，无 event_ttl 的事件始终有效，带
@@ -683,6 +730,7 @@ class EventCache:
         为 events_removed/discarded（形状与公开方法一致），
         cleanup_all_expired 为
         values_removed/dedupe_removed/events_removed，get/pop 为单个值，
+        get_with_reason 为含 found/value/reason 的 Result，
         pop_batch/peek 为普通 list，pop_live_batch/peek_live_batch 为含
         events/discarded 两个 list 的 Result，queue_status 为含
         size/max_queue 的 Result。回放写入的绝对到期时间与常规路径一致，
@@ -738,6 +786,10 @@ class EventCache:
                 _, key = op
                 # 按记录时刻判定键值 TTL：到期点 <= 记录时刻即移除并返回 None
                 results.append(self._get_at(key, now))
+            elif tag == 'get_with_reason':
+                _, key = op
+                # 与 get 共用记录时刻与 <= 边界，但返回带原因的诊断结果
+                results.append(self._get_with_reason_at(key, now))
             elif tag == 'pop':
                 # pop 不读取时间：过期事件同样按 FIFO 原样取出，空队列返回 None
                 results.append(self.pop())

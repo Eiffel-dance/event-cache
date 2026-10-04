@@ -200,6 +200,127 @@ class DeterministicTest(unittest.TestCase):
         self.assertEqual([self.cache.pop(), self.cache.pop()], ['e1', 'e2'])
 
 
+class GetWithReasonTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 三种结果形状 ----
+    def test_missing_key_returns_missing_without_clock(self):
+        result = self.cache.get_with_reason('x')
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertIsInstance(result, Result)
+        self.assertFalse(result.found)
+        self.assertIsNone(result.value)
+        self.assertEqual(result.reason, 'missing')
+        # 键访问与属性访问等价
+        self.assertEqual(
+            (result['found'], result['value'], result['reason']),
+            (False, None, 'missing'),
+        )
+
+    def test_live_value_returns_found_with_none_reason(self):
+        self.cache.put('a', 'v', 10)
+        calls_before = self.clock_calls[0]
+        result = self.cache.get_with_reason('a')
+        self.assertEqual(self.clock_calls[0], calls_before + 1)  # 只读一次时钟
+        self.assertEqual((result.found, result.value, result.reason), (True, 'v', None))
+
+    def test_falsy_live_values_report_found(self):
+        self.cache.put('n', None, 100)
+        self.cache.put('f', False, 100)
+        self.cache.put('z', 0, 100)
+        self.cache.put('e', '', 100)
+        for key, expected in (('n', None), ('f', False), ('z', 0), ('e', '')):
+            result = self.cache.get_with_reason(key)
+            self.assertTrue(result.found)
+            self.assertEqual(result.value, expected)
+            self.assertIsNone(result.reason)
+
+    def test_expired_value_returns_expired_and_removes_key(self):
+        self.cache.put('a', 'v', 5)
+        self.advance(5)  # 到期点 == 当前时刻：<= 边界即过期
+        result = self.cache.get_with_reason('a')
+        self.assertEqual((result.found, result.value, result.reason),
+                         (False, None, 'expired'))
+        self.assertNotIn('a', self.cache.values)
+
+    def test_expired_then_missing_on_repeat_read(self):
+        self.cache.put('a', 'v', 5)
+        self.advance(6)
+        first = self.cache.get_with_reason('a')
+        self.assertEqual(first.reason, 'expired')
+        second = self.cache.get_with_reason('a')
+        self.assertEqual((second.found, second.value, second.reason),
+                         (False, None, 'missing'))
+
+    def test_boundary_one_before_expiry_still_live(self):
+        self.cache.put('a', 'v', 5)
+        self.advance(4)  # 到期点 105 > 104：仍有效
+        result = self.cache.get_with_reason('a')
+        self.assertEqual((result.found, result.value), (True, 'v'))
+
+    # ---- 隔离性：不触碰其他状态、不触发批量清理 ----
+    def test_does_not_touch_queue_seen_or_capacity(self):
+        cache = EventCache(self.clock, max_queue=2)
+        cache.put('a', 'v', 0)          # 已过期但未被清理
+        cache.put('b', 'w', 100)
+        cache.push('d', 'e', 0)         # seen 记录已到期但保留
+        before = (list(cache.events), list(cache.event_expiries), dict(cache.seen))
+        result = cache.get_with_reason('a')
+        self.assertEqual(result.reason, 'expired')
+        self.assertEqual(
+            (list(cache.events), list(cache.event_expiries), dict(cache.seen)),
+            before,
+        )
+        self.assertEqual(cache.max_queue, 2)
+        self.assertIn('b', cache.values)  # 未触发 values 批量清理
+
+    def test_get_behavior_unchanged_by_new_entry(self):
+        self.cache.put('a', 'v', 5)
+        self.advance(6)
+        self.assertIsNone(self.cache.get('a'))  # get 仍返回 None 并移除
+        self.assertNotIn('a', self.cache.values)
+
+    # ---- 异常路径 ----
+    def test_unhashable_key_raises_type_error_without_clock(self):
+        with self.assertRaises(TypeError):
+            self.cache.get_with_reason(['unhashable'])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_clock_exception_propagates_and_preserves_state(self):
+        calls = [0]
+
+        def bad_clock():
+            calls[0] += 1
+            raise RuntimeError('clock failure')
+
+        cache = EventCache(bad_clock)
+        cache.values['a'] = ('v', 50)  # 直接布置状态，避开 put 的时钟读取
+        with self.assertRaises(RuntimeError):
+            cache.get_with_reason('a')
+        self.assertEqual(calls[0], 1)
+        self.assertEqual(cache.values, {'a': ('v', 50)})
+
+    def test_missing_key_with_failing_clock_still_returns_missing(self):
+        def bad_clock():
+            raise RuntimeError('clock failure')
+
+        cache = EventCache(bad_clock)
+        result = cache.get_with_reason('x')  # 键不存在：不读取时钟
+        self.assertEqual(result.reason, 'missing')
+
+
 class CapacityTest(unittest.TestCase):
     def setUp(self):
         self.now = [100]
@@ -2102,6 +2223,108 @@ class ReplayBatchTest(unittest.TestCase):
         self.assertIsNone(results[1])
         self.assertFalse(results[2].deleted)
         self.assertIsNone(results[3])
+
+    # ---- get_with_reason 记录：按记录时刻给出诊断结果 ----
+    def test_replay_get_with_reason_uses_record_timestamp(self):
+        results = self.cache.replay_batch([
+            (10, ('put', 'a', 'v', 5)),               # 到期点 15
+            (14, ('get_with_reason', 'a')),           # 14 < 15：命中
+            (15, ('get_with_reason', 'a')),           # 到期点 <= 记录时刻：过期并移除
+            (16, ('get_with_reason', 'a')),           # 已被移除：missing
+        ])
+        self.assertEqual(self.clock_calls[0], 0)      # 回放不读取注入时钟
+        hit, expired, missing = results[1:]
+        self.assertEqual((hit.found, hit.value, hit.reason), (True, 'v', None))
+        self.assertEqual((expired.found, expired.value, expired.reason),
+                         (False, None, 'expired'))
+        self.assertEqual((missing.found, missing.value, missing.reason),
+                         (False, None, 'missing'))
+        self.assertNotIn('a', self.cache.values)
+
+    def test_replay_get_with_reason_missing_key(self):
+        results = self.cache.replay_batch([(10, ('get_with_reason', 'x'))])
+        self.assertEqual(
+            (results[0].found, results[0].value, results[0].reason),
+            (False, None, 'missing'),
+        )
+
+    def test_replay_get_with_reason_falsy_live_value_is_found(self):
+        results = self.cache.replay_batch([
+            (10, ('put', 'n', None, 100)),
+            (10, ('put', 'f', False, 100)),
+            (10, ('get_with_reason', 'n')),
+            (10, ('get_with_reason', 'f')),
+        ])
+        self.assertEqual((results[2].found, results[2].value, results[2].reason),
+                         (True, None, None))
+        self.assertEqual((results[3].found, results[3].value, results[3].reason),
+                         (True, False, None))
+        self.assertIn('n', self.cache.values)  # 命中不移除
+
+    def test_replay_get_with_reason_removal_observable_by_later_records(self):
+        results = self.cache.replay_batch([
+            (10, ('put', 'a', 'v', 0)),
+            (20, ('get_with_reason', 'a')),     # 过期移除
+            (20, ('delete', 'a')),              # 已不存在 -> False
+            (20, ('get', 'a')),                 # 对 get 表现为不存在
+        ])
+        self.assertEqual(results[1].reason, 'expired')
+        self.assertFalse(results[2].deleted)
+        self.assertIsNone(results[3])
+
+    def test_replay_get_with_reason_result_shape(self):
+        results = self.cache.replay_batch([
+            (0, ('put', 'a', 'v', 10)),
+            (0, ('get_with_reason', 'a')),
+            (0, ('get_with_reason', 'b')),
+        ])
+        for result in results[1:]:
+            self.assertIsInstance(result, Result)
+            self.assertEqual(set(result), {'found', 'value', 'reason'})
+
+    def test_replay_get_with_reason_does_not_touch_queue_or_seen(self):
+        results = self.cache.replay_batch([
+            (0, ('push', 'd', 'e', 10)),
+            (0, ('put', 'a', 'v', 0)),          # 到期点 == 记录时刻
+            (5, ('get_with_reason', 'a')),      # 过期移除，只动该键
+            (5, ('queue_status',)),
+        ])
+        self.assertEqual(results[2].reason, 'expired')
+        self.assertEqual(results[3].size, 1)
+        self.assertEqual(list(self.cache.events), ['e'])
+        self.assertEqual(self.cache.seen, {'d': 10})
+
+    def test_invalid_get_with_reason_record_raises_atomically(self):
+        self.cache.put('k', 'v', 100)
+        before = (dict(self.cache.values), list(self.cache.events),
+                  list(self.cache.event_expiries), dict(self.cache.seen))
+        for bad in (
+            [(1, ('get_with_reason',))],               # 缺 key
+            [(1, ('get_with_reason', 'a', 'extra'))],  # 多余成员
+            [(1, ('put', 'a', 'v', 10)), (2, ('get_with_reason',))],
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(ValueError):
+                self.cache.replay_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+            after = (dict(self.cache.values), list(self.cache.events),
+                     list(self.cache.event_expiries), dict(self.cache.seen))
+            self.assertEqual(before, after)
+
+    def test_unhashable_get_with_reason_key_raises_type_error_atomically(self):
+        self.cache.put('k', 'v', 100)
+        before = (dict(self.cache.values), dict(self.cache.seen))
+        with self.assertRaises(TypeError):
+            self.cache.replay_batch([(1, ('get_with_reason', ['unhashable']))])
+        self.assertEqual((dict(self.cache.values), dict(self.cache.seen)), before)
+
+    def test_apply_batch_rejects_get_with_reason(self):
+        self.cache.put('k', 'v', 100)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.apply_batch([('get_with_reason', 'k')])
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.values['k'], ('v', 200))
 
     # ---- pop / pop_batch 记录：不读时间，过期事件原样返回 ----
     def test_replay_pop_returns_expired_events_without_time_judgement(self):
