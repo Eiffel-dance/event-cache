@@ -222,7 +222,8 @@ def _parse_apply_batch(batch):
     ('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
     ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)、
-    ('cleanup_all_expired',) 或 ('discard_expired_events',)。
+    ('cleanup_all_expired',)、('discard_expired_events',) 或
+    ('cleanup_expired_events',)。
     批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window/
     event_ttl 非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为
     缓存索引时抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
@@ -231,7 +232,7 @@ def _parse_apply_batch(batch):
         iterator = iter(batch)
     except TypeError:
         raise ValueError('operations must be an iterable of operation tuples')
-    return [_parse_operation(item) for item in iterator]
+    return [_parse_operation(item, allow_event_cleanup=True) for item in iterator]
 
 
 def _parse_replay_batch(records):
@@ -617,6 +618,10 @@ class EventCache:
                         values_removed=values_removed,
                         dedupe_removed=dedupe_removed,
                     ))
+                elif tag == 'cleanup_expired_events':
+                    # 与整批共享同一时钟读数：到期点 <= 统一观察时刻的带 TTL
+                    # 事件全部移除并立即释放槽位，values、seen、max_queue 不变
+                    results.append(Result(events_removed=self._cleanup_events_at(now)))
                 elif tag == 'discard_expired_events':
                     # 与整批共享同一时钟读数，按操作顺序影响后续操作
                     discarded = self._discard_expired_events_at(now)
