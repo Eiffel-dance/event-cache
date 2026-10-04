@@ -14,6 +14,10 @@ _OVERFLOW_POLICIES = frozenset(('reject_new', 'drop_oldest'))
 _DISCARD_REASONS = frozenset(('event_ttl', 'queue_full'))
 _DISCARD_ENTRY_FIELDS = frozenset(('event', 'reason', 'timestamp'))
 
+# resize_queue 的 overflow_policy 缺省哨兵：省略时沿用当前策略；
+# 显式传入（含 None）必须能通过 _check_overflow_policy 校验
+_KEEP_POLICY = object()
+
 
 class Result(dict):
     """结果对象：同时支持属性访问 (r.accepted) 与键访问 (r['accepted'])。"""
@@ -139,6 +143,8 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('push', dedupe, event, window)、
     ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)、
     ('cleanup_all_expired',) 或 ('discard_expired_events',)；
+    运行期容量调整 ('resize_queue', max_queue) 或
+    ('resize_queue', max_queue, overflow_policy)（二元形式沿用当前策略）；
     allow_event_cleanup 为真时额外接受
     ('cleanup_expired_events',)；
     allow_reads 为真时再接受读取与出队路径的记录：('get', key)、
@@ -146,9 +152,9 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('peek',)、('peek', limit)、('pop_live_batch',)、('pop_live_batch', limit)、
     ('peek_live_batch',)、('peek_live_batch', limit) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数。
-    条目不是元组、标签未知、元组长度不符或 ttl/window/event_ttl/limit
-    非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为缓存索引时
-    抛出 TypeError。返回物化后的操作元组。
+    条目不是元组、标签未知、元组长度不符或 ttl/window/event_ttl/limit/
+    max_queue/overflow_policy 非法时统一抛出 ValueError；key/dedupe 不可哈希、无法
+    作为缓存索引时抛出 TypeError。返回物化后的操作元组。
     """
     if not isinstance(item, tuple) or len(item) == 0:
         raise ValueError('each operation must be a tagged tuple')
@@ -196,6 +202,21 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
             raise ValueError(
                 "'discard_expired_events' operation must be ('discard_expired_events',)")
         return ('discard_expired_events',)
+    if tag == 'resize_queue':
+        # 二元形式省略 overflow_policy（物化为 None 表示沿用当前策略）；
+        # 三元形式的策略必须显式合法，max_queue 与构造入口同一校验
+        if len(item) == 2:
+            max_queue = item[1]
+            policy = None
+        elif len(item) == 3:
+            max_queue, policy = item[1], item[2]
+            _check_overflow_policy(policy)
+        else:
+            raise ValueError(
+                "'resize_queue' operation must be ('resize_queue', max_queue) "
+                "or ('resize_queue', max_queue, overflow_policy)")
+        _check_max_queue(max_queue)
+        return ('resize_queue', max_queue, policy)
     if tag == 'cleanup_expired_events' and allow_event_cleanup:
         if len(item) != 1:
             raise ValueError(
@@ -242,11 +263,12 @@ def _parse_apply_batch(batch):
     ('put', key, value, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
     ('push_expiring', dedupe, event, window, event_ttl)、('cleanup',)、
-    ('cleanup_all_expired',)、('discard_expired_events',) 或
+    ('cleanup_all_expired',)、('discard_expired_events',)、
+    ('resize_queue', max_queue[, overflow_policy]) 或
     ('cleanup_expired_events',)。
     批次不可迭代、条目不是元组、标签未知、元组长度不符或 ttl/window/
-    event_ttl 非法时统一抛出 ValueError；key/dedupe 不可哈希、无法作为
-    缓存索引时抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
+    event_ttl/max_queue/overflow_policy 非法时统一抛出 ValueError；key/dedupe
+    不可哈希、无法作为缓存索引时抛出 TypeError。物化后的操作列表供调用方在同一时钟时刻顺序执行。
     """
     try:
         iterator = iter(batch)
@@ -262,13 +284,13 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/delete/push/push_expiring/cleanup/
-    cleanup_all_expired/discard_expired_events 与
+    cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
     ('get_with_reason', key)、('pop',)、('pop_batch'[, limit])、('peek'[, limit])、
     ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数。
     records 不可迭代、记录不是二元结构、时间戳非法或倒退、操作结构/标签/
-    参数数量/时长/limit 非法时统一抛出 ValueError；key/dedupe 不可哈希时
+    参数数量/时长/limit/max_queue/overflow_policy 非法时统一抛出 ValueError；key/dedupe 不可哈希时
     原样抛出 TypeError。返回物化后的 (timestamp, operation) 列表，供调用
     方按各自记录时刻顺序回放。
     """
@@ -757,6 +779,11 @@ class EventCache:
                         events_removed=len(discarded),
                         discarded=discarded,
                     ))
+                elif tag == 'resize_queue':
+                    _, max_queue, policy = op
+                    # 与整批共享同一时钟读数：挤出丢弃的历史时间戳取批次
+                    # 观察时刻；新容量与策略立即生效，后续操作据此判定
+                    results.append(self._resize_queue_at(max_queue, policy, now))
                 else:  # 'cleanup_all_expired'
                     # 与整批共享同一时钟读数，按操作顺序影响后续操作
                     values_removed, dedupe_removed, events_removed = \
@@ -774,7 +801,7 @@ class EventCache:
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
         put/delete/push/push_expiring/cleanup/cleanup_all_expired/
-        discard_expired_events 与
+        discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
         ('get', key)、('get_with_reason', key)、('pop',)、
         ('pop_batch'[, limit])、('peek'[, limit])、
@@ -783,7 +810,8 @@ class EventCache:
         TTL、event_ttl 与去重窗口的绝对边界，同一时间戳共享该边界；回放
         全程不读取注入时钟、不启动后台线程，记录时间的推进本身不触发
         values/seen/事件的任何自动清理。溢出挤出（drop_oldest 的
-        queue_full）、事件 TTL 清理（cleanup_expired_events、
+        queue_full 与 resize_queue 缩容挤出）、事件 TTL 清理
+        （cleanup_expired_events、
         discard_expired_events、cleanup_all_expired）与过期感知出队
         （pop_live_batch）产生的丢弃审计历史与实时调用完全一致：按操作
         顺序追加，timestamp 取各记录自带时间戳而非注入时钟；普通
@@ -819,6 +847,8 @@ class EventCache:
         delete 为 deleted，cleanup 为 values_removed/dedupe_removed，
         cleanup_expired_events 为 events_removed，discard_expired_events
         为 events_removed/discarded（形状与公开方法一致），
+        resize_queue 为 max_queue/overflow_policy/discarded（形状与
+        公开 resize_queue 一致，后续记录按新容量与策略判定），
         cleanup_all_expired 为
         values_removed/dedupe_removed/events_removed，get/pop 为单个值，
         get_with_reason 为含 found/value/reason 三个字段的 Result，
@@ -864,6 +894,11 @@ class EventCache:
                     events_removed=len(discarded),
                     discarded=discarded,
                 ))
+            elif tag == 'resize_queue':
+                _, max_queue, policy = op
+                # 以记录自带时刻为观察点写入挤出丢弃历史，不读取注入时钟；
+                # 新容量与策略对后续记录立即生效
+                results.append(self._resize_queue_at(max_queue, policy, now))
             elif tag == 'cleanup_all_expired':
                 # 以记录自带时刻为观察点，不读取注入时钟
                 values_removed, dedupe_removed, events_removed = \
@@ -1050,6 +1085,70 @@ class EventCache:
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
 
+    def _resize_queue_at(self, max_queue, overflow_policy, now):
+        # 在指定观察时刻应用新的容量与溢出策略；max_queue/overflow_policy 由
+        # 调用方先行校验，overflow_policy 为 None 表示沿用当前策略。now 由
+        # 调用方显式提供（实时路径为当时钟读数，回放路径为记录时间戳），
+        # 本方法自身绝不读取注入时钟。缩容超出现有队列长度时按 FIFO 队首
+        # 挤出至新上限（过期事件照样计数，不做任何过期扫描；max_queue 为零
+        # 则全部挤出），被挤出事件同步移除其 event_expiries 元数据但保留
+        # 对应 seen 去重记录，并按 now 追加 reason='queue_full' 的审计历史。
+        if overflow_policy is None:
+            overflow_policy = self.overflow_policy
+        self.max_queue = max_queue
+        self.overflow_policy = overflow_policy
+        discarded = []
+        if max_queue is not None:
+            while len(self.events) > max_queue:
+                evicted = self.events.popleft()
+                self.event_expiries.popleft()
+                # 事件值为 None 也保留该条丢弃记录；审计历史固定
+                # reason='queue_full'，时间戳取本次调整的观察时刻 now
+                discarded.append(Result(event=evicted, reason='queue_full'))
+                self._record_discard(evicted, 'queue_full', now)
+        return Result(max_queue=max_queue, overflow_policy=overflow_policy,
+                      discarded=discarded)
+
+    def resize_queue(self, max_queue, overflow_policy=_KEEP_POLICY):
+        """运行期调整队列容量与溢出策略，不改变既有读写与出队语义。
+
+        max_queue 为 None（无限）或非负整数；overflow_policy 省略时沿用当前
+        策略，显式给出时只能是 'reject_new' 或 'drop_oldest'。两个参数在
+        读取时钟或改变任何状态前完整校验，非法时抛出 ValueError 且
+        values/events/event_expiries/seen、现有容量策略与丢弃历史全部保持
+        不变。
+
+        扩容、保持容量或只换策略时不清理任何值、去重记录或事件，也不因已有
+        过期项扫描队列，且不读取注入时钟。缩容后的上限低于现有队列长度时，
+        按 FIFO 从队首挤出至新上限：过期事件照样计入长度（不做过期判定），
+        max_queue 为零则全部挤出；每个被挤出事件按顺序以
+        Result(event=原事件值, reason='queue_full') 放入返回的 discarded，
+        同步移除其 event_expiries 元数据，但对应 seen 去重记录保留到原窗口
+        截止。需要挤出时整次调用只读取一次注入时钟，并以该时刻为每个被挤出
+        事件追加 reason='queue_full' 的丢弃审计历史（受
+        discard_history_limit 容量约束）；时钟抛出的异常原样传播，且配置、
+        队列、到期信息与历史均保持不变。
+
+        返回 Result(max_queue=生效后的上限, overflow_policy=生效后的策略,
+        discarded=被挤出事件的丢弃记录列表)，无挤出时 discarded 为空列表。
+        新配置立即反映到 queue_status 与 snapshot，后续 push/cleanup/pop
+        等操作按新容量与策略判定。
+        """
+        # 校验失败时不读取时钟，也不改变任何状态
+        _check_max_queue(max_queue)
+        if overflow_policy is _KEEP_POLICY:
+            policy = None  # 沿用当前策略
+        else:
+            _check_overflow_policy(overflow_policy)
+            policy = overflow_policy
+        # 仅在确实需要挤出时读取时钟，且整次调用只读一次；时钟异常在
+        # 任何状态修改之前抛出，配置与队列保持原样
+        if max_queue is not None and len(self.events) > max_queue:
+            now = self.clock()
+        else:
+            now = None
+        return self._resize_queue_at(max_queue, policy, now)
+
     def discard_history(self, limit=None):
         """返回丢弃审计历史的独立副本，按丢弃先后排列。
 
@@ -1057,7 +1156,8 @@ class EventCache:
         （cleanup_expired_events、discard_expired_events、
         cleanup_all_expired、apply_batch/replay_batch 中的对应操作以及
         pop_live_batch 的过期感知出队），原因固定为 'event_ttl'；
-        drop_oldest 策略下入队从队首挤出事件，原因固定为 'queue_full'。
+        drop_oldest 策略下入队从队首挤出事件，或 resize_queue 缩容时按
+        FIFO 队首挤出事件，原因固定为 'queue_full'。
         普通 pop/pop_batch 消费、reject_new 下的 queue_full 拒绝与
         dedupe_window 拒绝一律不写历史。每项为
         Result(event=原事件值, reason=原因, timestamp=触发该丢弃动作的那次
