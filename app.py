@@ -313,11 +313,15 @@ def _parse_snapshot(snapshot):
     int/float（允许负数），event 可为任意对象（含 None）；
     discard_history_limit 为 None 或非负整数。两个历史字段均可省略：
     缺 discard_history 按空历史解释，缺 discard_history_limit 按无限容量
-    解释，只给出其一时另一项按缺省解释。三类到期时间（values 的
+    解释，只给出其一时另一项按缺省解释。max_queue 为非负整数时 events 的
+    条目数不得超过该上限（max_queue 为 0 时只能恢复空队列），容量判断针对
+    实际事件条目数，与事件是否已到期无关；超过容量的快照整体拒绝，不截断、
+    不自动挤出、不接受后留待下一次写入处理。三类到期时间（values 的
     expires_at、seen 的到期时刻、event_expiries 的非 None 项）都只能是非
     bool 的有限 int/float，允许负数与已过期时刻，不解释为相对时长。字段
     缺失或多余、非映射/列表容器、二元组结构不符、event_expiries 长度不
-    一致、overflow_policy 非法、历史条目结构/原因/时间戳非法、
+    一致、事件条目数超过 max_queue、overflow_policy 非法、历史条目结构/
+    原因/时间戳非法、
     discard_history_limit 非法或任一到期值为 NaN/无穷/字符串/复合对象、
     max_queue 非法时统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
     校验期间一次性物化为全新的 dict/list/deque，供调用方随后整体替换状态。
@@ -353,6 +357,12 @@ def _parse_snapshot(snapshot):
         seen[key] = expiry
     # list() 物化事件副本；值与事件对象按既有语义保留引用
     events = deque(raw_events)
+    # 有限容量快照的边界：事件条目数不得超过 max_queue（max_queue 为 0 时
+    # 只能恢复空队列）。容量判断针对实际事件条目数，与事件是否已到期无关；
+    # 超过容量的快照整体拒绝，不截断、不挤出、不接受后留待后续写入处理
+    max_queue = snapshot['max_queue']
+    if max_queue is not None and len(events) > max_queue:
+        raise ValueError('snapshot events must not exceed max_queue')
     if 'event_expiries' in snapshot:
         raw_expiries = snapshot['event_expiries']
         if not isinstance(raw_expiries, list):
@@ -399,7 +409,7 @@ def _parse_snapshot(snapshot):
             discard_history = deque()
         else:
             discard_history = deque(list(discard_history)[-discard_history_limit:])
-    return (values, events, event_expiries, seen, snapshot['max_queue'],
+    return (values, events, event_expiries, seen, max_queue,
             overflow_policy, discard_history, discard_history_limit)
 
 
@@ -1131,7 +1141,10 @@ class EventCache:
         无限容量解释，旧快照因此保持兼容。历史条目必须是恰好含
         event/reason/timestamp 的映射，reason 只能是 'event_ttl' 或
         'queue_full'，timestamp 为非 bool 的有限 int/float，历史容量为
-        None 或非负整数，任一非法都抛出 ValueError 且保持原状态。成功后以
+        None 或非负整数，任一非法都抛出 ValueError 且保持原状态。max_queue
+        为非负整数时 events 条目数不得超过该上限（为 0 时只能恢复空队列），
+        容量判断针对实际事件条目而非过期与否，超过容量的快照同样抛出
+        ValueError：不截断、不自动挤出、不接受后留待下一次写入处理。成功后以
         副本整体替换状态并返回 None，恢复出的容器（含历史）与传入快照相互
         独立。恢复后一律由本实例当前时间源按既有的 expiry <= now 边界判定
         过期，不隐式清理、不释放队列槽位、不延长去重窗口。
