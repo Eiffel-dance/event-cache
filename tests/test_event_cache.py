@@ -1832,12 +1832,23 @@ class ExpiringSnapshotTest(unittest.TestCase):
         snap['event_expiries'][0] = 999
         self.assertEqual(list(self.cache.event_expiries), [150])
 
-    def test_snapshot_after_cleanup_of_all_ttl_events_has_four_fields(self):
+    def test_snapshot_after_cleanup_of_all_ttl_events_drops_expiries_but_keeps_history(self):
         self.cache.push_expiring('d', 'e', 10, 0)
         self.cache.push('d2', 'plain', 10)
         self.cache.cleanup_expired_events()
         snap = self.cache.snapshot()
-        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        # 所有带 TTL 事件清空后不再有 event_expiries 字段……
+        self.assertNotIn('event_expiries', snap)
+        # ……但清理动作写入了丢弃历史，按新规格历史非空时保留历史字段
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'discard_history', 'discard_history_limit',
+        })
+        self.assertEqual(len(snap.discard_history), 1)
+        entry = snap.discard_history[0]
+        self.assertEqual((entry.event, entry.reason), ('e', 'event_ttl'))
+        self.assertIsInstance(entry.timestamp, (int, float))
+        self.assertIsNone(snap.discard_history_limit)
 
     # ---- restore 新格式 ----
     def test_restore_new_format_round_trip(self):
@@ -2609,6 +2620,744 @@ class ReplayBatchTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cache.replay_batch(gen())
         self.assertEqual(list(self.cache.events), ['e'])  # 前段记录也不得生效
+
+
+class DiscardHistoryTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, max_queue=None, overflow_policy='reject_new', history_limit=None):
+        return EventCache(self.clock, max_queue=max_queue,
+                          overflow_policy=overflow_policy,
+                          discard_history_limit=history_limit)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def triple(self, entry):
+        return (entry.event, entry.reason, entry.timestamp)
+
+    # ---- 构造参数校验 ----
+    def test_default_history_limit_is_unlimited(self):
+        cache = self.make()
+        self.assertIsNone(cache.discard_history_limit)
+        self.assertEqual(cache.discard_history(), [])
+
+    def test_invalid_history_limit_raises_value_error(self):
+        for bad in (-1, -10, True, False, 1.5, 2.0, '3', [], object()):
+            with self.assertRaises(ValueError):
+                self.make(history_limit=bad)
+
+    def test_invalid_history_limit_does_not_read_clock(self):
+        calls = [0]
+
+        def counting_clock():
+            calls[0] += 1
+            return 0
+
+        for bad in (-1, True, 'x'):
+            with self.assertRaises(ValueError):
+                EventCache(counting_clock, discard_history_limit=bad)
+        self.assertEqual(calls[0], 0)
+
+    def test_zero_and_positive_and_none_limits_accepted(self):
+        for limit in (None, 0, 1, 10 ** 6):
+            cache = self.make(history_limit=limit)
+            self.assertIs(cache.discard_history_limit, limit)
+
+    # ---- event_ttl 清理写入历史 ----
+    def test_cleanup_expired_events_records_history(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 100, 5)   # 到期点 105
+        cache.push('d2', 'e2', 100)
+        cache.push_expiring('d3', 'e3', 100, 500)
+        self.advance(10)  # 110
+        result = cache.cleanup_expired_events()
+        self.assertEqual(result.events_removed, 1)
+        history = cache.discard_history()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(self.triple(history[0]), ('e1', 'event_ttl', 110))
+
+    def test_discard_expired_events_records_history_with_observation_time(self):
+        cache = self.make()
+        cache.push_expiring('d', 'e', 100, 5)
+        self.advance(7)  # 107
+        r = cache.discard_expired_events()
+        # 返回的 discarded 条目保持既有形状（无 timestamp），且与历史条目是不同对象
+        self.assertEqual(set(r.discarded[0]), {'event', 'reason'})
+        history = cache.discard_history()
+        self.assertEqual(set(history[0]), {'event', 'reason', 'timestamp'})
+        self.assertEqual(self.triple(history[0]), ('e', 'event_ttl', 107))
+        self.assertIsNot(r.discarded[0], history[0])
+
+    def test_cleanup_all_expired_records_event_history(self):
+        cache = self.make()
+        cache.put('k', 'v', 5)
+        cache.push_expiring('d', 'e', 100, 5)
+        self.advance(10)  # 110
+        cache.cleanup_all_expired()
+        history = cache.discard_history()
+        # values/seen 的清理不写历史，只有事件一条
+        self.assertEqual([self.triple(h) for h in history], [('e', 'event_ttl', 110)])
+
+    def test_multiple_ttl_events_recorded_in_fifo_order_with_same_timestamp(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'x1', 100, 1)
+        cache.push_expiring('d2', 'a', 100, 500)
+        cache.push_expiring('d3', 'x2', 100, 1)
+        cache.push_expiring('d4', 'x3', 100, 2)
+        self.advance(10)  # 110
+        cache.cleanup_expired_events()
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], [
+            ('x1', 'event_ttl', 110),
+            ('x2', 'event_ttl', 110),
+            ('x3', 'event_ttl', 110),
+        ])
+
+    def test_pop_live_batch_records_expired_in_scan_order(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'x1', 100, 1)
+        cache.push('d2', 'a', 100)
+        cache.push_expiring('d3', 'x2', 100, 1)
+        self.advance(10)  # 110
+        r = cache.pop_live_batch()
+        # 返回的 discarded 仍是两字段形状
+        self.assertEqual([set(d) for d in r.discarded], [{'event', 'reason'}] * 2)
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], [
+            ('x1', 'event_ttl', 110),
+            ('x2', 'event_ttl', 110),
+        ])
+
+    def test_pop_live_batch_timestamp_matches_its_clock_read(self):
+        # 时间戳是触发本次出队的观察时刻，而非事件到期点
+        cache = self.make()
+        cache.push_expiring('d', 'e', 100, 5)  # 到期点 105
+        self.advance(5)  # 恰为 105：<= 边界
+        cache.pop_live_batch()
+        self.assertEqual(cache.discard_history()[0].timestamp, 105)
+
+        # 独立时钟：到期点同为 105，但观察时刻拖到 300，时间戳取 300
+        other_now = [100]
+        cache2 = EventCache(lambda: other_now[0])
+        cache2.push_expiring('d2', 'e2', 100, 5)
+        other_now[0] = 300
+        cache2.pop_live_batch()
+        self.assertEqual(cache2.discard_history()[0].timestamp, 300)
+
+    # ---- drop_oldest 挤出写入历史 ----
+    def test_drop_oldest_eviction_records_queue_full_history(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        self.advance(5)  # 105
+        r = cache.push_with_reason('d3', 'e3', 100)
+        self.assertTrue(r.accepted)
+        self.assertEqual(r.discarded[0].event, 'e1')  # 既有 discarded 形状不变
+        self.assertEqual(set(r.discarded[0]), {'event', 'reason'})
+        history = cache.discard_history()
+        self.assertEqual(self.triple(history[0]), ('e1', 'queue_full', 105))
+        self.assertEqual([cache.pop(), cache.pop()], ['e2', 'e3'])
+
+    def test_push_batch_evictions_use_batch_moment_in_order(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        # 整批同一时钟时刻 100：第 3 项挤出 e1，第 4 项挤出 e2
+        results = cache.push_batch([
+            ('d1', 'e1', 100), ('d2', 'e2', 100),
+            ('d3', 'e3', 100), ('d4', 'e4', 100),
+        ])
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], [
+            ('e1', 'queue_full', 100),
+            ('e2', 'queue_full', 100),
+        ])
+        self.assertEqual(cache.pop_batch(), ['e3', 'e4'])
+
+    def test_apply_batch_ttl_and_eviction_history_follow_operation_order(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        results = cache.apply_batch([
+            ('push_expiring', 'd1', 'old', 100, 0),  # 接受时已到期，占槽
+            ('cleanup_expired_events',),              # 清掉 old -> event_ttl
+            ('push', 'd2', 'a', 100),                # 入队
+            ('push', 'd3', 'b', 100),                # 挤出 a -> queue_full
+        ])
+        self.assertEqual(results[1].events_removed, 1)
+        self.assertTrue(results[3].accepted)
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], [
+            ('old', 'event_ttl', 100),
+            ('a', 'queue_full', 100),
+        ])
+
+    # ---- 不写历史的路径 ----
+    def test_plain_pop_and_pop_batch_do_not_record_history(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'x', 100, 0)  # 已到期
+        cache.push('d2', 'y', 100)
+        self.advance(100)
+        self.assertEqual(cache.pop(), 'x')
+        self.assertEqual(cache.pop_batch(), ['y'])
+        self.assertEqual(cache.discard_history(), [])
+
+    def test_reject_new_queue_full_does_not_record_history(self):
+        cache = self.make(max_queue=1)
+        cache.push('d1', 'e1', 100)
+        r = cache.push_with_reason('d2', 'e2', 100)
+        self.assertEqual(r.reason, 'queue_full')
+        self.assertEqual(cache.discard_history(), [])
+
+    def test_dedupe_rejection_does_not_record_history(self):
+        cache = self.make()
+        cache.push('d', 'e1', 100)
+        self.assertEqual(cache.push_with_reason('d', 'e2', 100).reason, 'dedupe_window')
+        self.assertEqual(cache.discard_history(), [])
+
+    def test_peek_live_batch_never_records_history(self):
+        cache = self.make()
+        cache.push_expiring('d', 'x', 100, 0)
+        self.advance(10)
+        r = cache.peek_live_batch()
+        self.assertEqual([d.event for d in r.discarded], ['x'])
+        self.assertEqual(cache.discard_history(), [])  # 纯观察不留历史
+        self.assertEqual(cache.queue_status().size, 1)
+
+    def test_get_expiry_and_value_cleanup_do_not_record_history(self):
+        cache = self.make()
+        cache.put('k', 'v', 0)
+        cache.push_expiring('d', 'e', 100, 100)  # 事件未到期
+        self.advance(1)
+        self.assertIsNone(cache.get('k'))         # 值过期不写历史
+        self.assertEqual(cache.cleanup().values_removed, 0)
+        cache.put('k2', 'v2', 0)
+        self.assertEqual(cache.cleanup().values_removed, 1)  # 批量值清理不写
+        self.assertEqual(cache.discard_history(), [])
+
+    # ---- None 事件也记录 ----
+    def test_none_event_is_recorded(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', None, 100)
+        cache.push('d2', 'second', 100)
+        history = cache.discard_history()
+        self.assertEqual(len(history), 1)
+        self.assertIsNone(history[0].event)
+        self.assertEqual((history[0].reason, history[0].timestamp), ('queue_full', 100))
+
+    def test_none_event_recorded_on_ttl_cleanup(self):
+        cache = self.make()
+        cache.push_expiring('d', None, 100, 0)
+        cache.cleanup_expired_events()
+        history = cache.discard_history()
+        self.assertEqual(len(history), 1)
+        self.assertIsNone(history[0].event)
+        self.assertEqual(history[0].reason, 'event_ttl')
+
+    # ---- 容量上限：只保留最近记录 ----
+    def test_finite_limit_keeps_most_recent(self):
+        cache = self.make(history_limit=2)
+        for i in range(5):
+            cache.push_expiring('d%d' % i, 'e%d' % i, 100, 0)
+            cache.cleanup_expired_events()  # 每步 t=100+i（push 与 cleanup 各读一次钟但同值）
+        history = cache.discard_history()
+        self.assertEqual(len(history), 2)
+        self.assertEqual([h.event for h in history], ['e3', 'e4'])
+
+    def test_zero_limit_retains_nothing_but_operations_still_succeed(self):
+        cache = self.make(history_limit=0)
+        cache.push_expiring('d', 'e', 100, 0)
+        self.assertEqual(cache.cleanup_expired_events().events_removed, 1)
+        self.assertEqual(cache.discard_history(), [])
+        # 丢弃仍返回即时结果
+        r = cache.discard_expired_events()
+        self.assertEqual(r.events_removed, 0)
+
+    def test_zero_limit_with_drop_oldest_retains_nothing(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest', history_limit=0)
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)  # 挤出 e1 但不留历史
+        self.assertEqual(cache.discard_history(), [])
+        self.assertEqual(cache.pop(), 'e2')
+
+    def test_unlimited_history_grows_unbounded(self):
+        cache = self.make()
+        for i in range(50):
+            cache.push_expiring('d%d' % i, i, 100, 0)
+            cache.cleanup_expired_events()
+        self.assertEqual(len(cache.discard_history()), 50)
+
+    # ---- discard_history(limit) 读取 ----
+    def test_history_returns_independent_detached_results(self):
+        cache = self.make()
+        cache.push_expiring('d', 'e', 100, 0)
+        cache.cleanup_expired_events()
+        first = cache.discard_history()
+        second = cache.discard_history()
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first[0], second[0])
+        first[0]['event'] = 'hacked'
+        first.append(Result(event='x', reason='event_ttl', timestamp=1))
+        internal = cache.discard_history()
+        self.assertEqual(internal[0].event, 'e')
+        self.assertEqual(len(internal), 1)
+
+    def test_history_limit_returns_recent_entries_only(self):
+        cache = self.make()
+        for i, ev in enumerate(['a', 'b', 'c', 'd']):
+            cache.push_expiring('d%d' % i, ev, 100, 0)
+            cache.cleanup_expired_events()
+        self.assertEqual([h.event for h in cache.discard_history(2)], ['c', 'd'])
+        self.assertEqual([h.event for h in cache.discard_history(0)], [])
+        self.assertEqual([h.event for h in cache.discard_history(10)], ['a', 'b', 'c', 'd'])
+        self.assertEqual([h.event for h in cache.discard_history(None)], ['a', 'b', 'c', 'd'])
+        # 带 limit 的读取不改变内部历史
+        self.assertEqual(len(cache.discard_history()), 4)
+
+    def test_history_limit_validation_does_not_read_clock_or_mutate(self):
+        cache = self.make()
+        cache.push_expiring('d', 'e', 100, 0)
+        cache.cleanup_expired_events()
+        self.clock_calls[0] = 0
+        for bad in (-1, -5, 1.5, 2.0, '2', [2], True, False, object()):
+            with self.assertRaises(ValueError):
+                cache.discard_history(bad)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(len(cache.discard_history()), 1)
+
+    def test_history_zero_limit_does_not_read_clock(self):
+        cache = self.make()
+        cache.push_expiring('d', 'e', 100, 0)
+        self.clock_calls[0] = 0
+        self.assertEqual(cache.discard_history(0), [])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_history_entries_are_results_with_attribute_access(self):
+        cache = self.make()
+        cache.push_expiring('d', 'e', 100, 0)
+        cache.cleanup_expired_events()
+        entry = cache.discard_history()[0]
+        self.assertIsInstance(entry, Result)
+        self.assertEqual(entry.event, 'e')
+        self.assertEqual(entry.reason, 'event_ttl')
+        self.assertIsInstance(entry.timestamp, (int, float))
+        self.assertEqual(entry['timestamp'], entry.timestamp)
+
+    # ---- clear_discard_history ----
+    def test_clear_returns_count_and_empties_history(self):
+        cache = self.make()
+        for i in range(3):
+            cache.push_expiring('d%d' % i, i, 100, 0)
+            cache.cleanup_expired_events()
+        self.assertEqual(len(cache.discard_history()), 3)
+        self.assertEqual(cache.clear_discard_history(), 3)
+        self.assertEqual(cache.discard_history(), [])
+        self.assertEqual(cache.clear_discard_history(), 0)  # 再次清空返回 0
+
+    def test_clear_does_not_read_clock_or_touch_other_state(self):
+        cache = self.make(max_queue=2, overflow_policy='drop_oldest')
+        cache.put('k', 'v', 100)
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        cache.push('d3', 'e3', 100)  # 挤出 e1
+        events_before = list(cache.events)
+        self.clock_calls[0] = 0
+        removed = cache.clear_discard_history()
+        self.assertEqual(removed, 1)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(list(cache.events), events_before)
+        self.assertEqual(cache.get('k'), 'v')
+        self.assertEqual(cache.queue_status().size, 2)
+
+    def test_clear_then_history_accumulates_again(self):
+        cache = self.make()
+        cache.push_expiring('d', 'e1', 100, 0)
+        cache.cleanup_expired_events()
+        cache.clear_discard_history()
+        cache.push_expiring('d2', 'e2', 100, 0)
+        cache.cleanup_expired_events()
+        self.assertEqual([h.event for h in cache.discard_history()], ['e2'])
+
+
+class DiscardHistorySnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, **kwargs):
+        return EventCache(self.clock, **kwargs)
+
+    def seed_history(self, cache):
+        cache.push_expiring('d1', 'e1', 100, 5)   # 105
+        cache.push_expiring('d2', 'e2', 100, 500)
+        self.now[0] = 110
+        cache.cleanup_expired_events()             # e1 -> (e1, event_ttl, 110)
+
+    # ---- 快照字段出现条件 ----
+    def test_default_snapshot_keeps_four_fields(self):
+        cache = self.make()
+        cache.push('d', 'e', 100)
+        self.assertEqual(set(cache.snapshot()), {'values', 'events', 'seen', 'max_queue'})
+
+    def test_snapshot_includes_history_when_nonempty(self):
+        cache = self.make()
+        self.seed_history(cache)
+        snap = cache.snapshot()
+        self.assertIn('discard_history', snap)
+        self.assertIn('discard_history_limit', snap)
+        self.assertIsNone(snap.discard_history_limit)
+        entries = snap.discard_history
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0].event, entries[0].reason, entries[0].timestamp),
+                         ('e1', 'event_ttl', 110))
+
+    def test_snapshot_includes_limit_when_nondefault_even_if_empty(self):
+        for limit in (0, 5):
+            cache = self.make(discard_history_limit=limit)
+            snap = cache.snapshot()
+            self.assertEqual(snap.discard_history, [])
+            self.assertEqual(snap['discard_history_limit'], limit)
+
+    def test_fields_disappear_after_clear_with_default_limit(self):
+        cache = self.make()
+        self.seed_history(cache)
+        cache.clear_discard_history()
+        snap = cache.snapshot()
+        self.assertNotIn('discard_history', snap)
+        self.assertNotIn('discard_history_limit', snap)
+
+    def test_snapshot_history_detached_from_cache(self):
+        cache = self.make()
+        self.seed_history(cache)
+        snap = cache.snapshot()
+        snap['discard_history'].append(Result(event='x', reason='event_ttl', timestamp=1))
+        snap['discard_history'][0]['event'] = 'hacked'
+        internal = cache.discard_history()
+        self.assertEqual(len(internal), 1)
+        self.assertEqual(internal[0].event, 'e1')
+
+    # ---- restore：旧快照兼容 ----
+    def test_restore_old_snapshot_gives_empty_unlimited_history(self):
+        cache = self.make()
+        self.seed_history(cache)
+        cache.restore({'values': {}, 'events': [], 'seen': {}, 'max_queue': None})
+        self.assertEqual(cache.discard_history(), [])
+        self.assertIsNone(cache.discard_history_limit)
+        # 恢复后快照回到四字段
+        self.assertEqual(set(cache.snapshot()), {'values', 'events', 'seen', 'max_queue'})
+
+    def test_restore_history_only_field_implies_unlimited_limit(self):
+        cache = self.make()
+        cache.restore({
+            'values': {}, 'events': [], 'seen': {}, 'max_queue': None,
+            'discard_history': [{'event': 'e', 'reason': 'queue_full', 'timestamp': 7}],
+        })
+        self.assertIsNone(cache.discard_history_limit)
+        entry = cache.discard_history()[0]
+        self.assertEqual((entry.event, entry.reason, entry.timestamp), ('e', 'queue_full', 7))
+        self.assertIsInstance(entry, Result)
+
+    def test_restore_limit_only_field_implies_empty_history(self):
+        cache = self.make()
+        self.seed_history(cache)
+        cache.restore({
+            'values': {}, 'events': [], 'seen': {}, 'max_queue': None,
+            'discard_history_limit': 3,
+        })
+        self.assertEqual(cache.discard_history(), [])
+        self.assertEqual(cache.discard_history_limit, 3)
+
+    def test_restore_deep_copies_history_containers(self):
+        source = {'event': 'e', 'reason': 'event_ttl', 'timestamp': 5}
+        snap = {
+            'values': {}, 'events': [], 'seen': {}, 'max_queue': None,
+            'discard_history': [source], 'discard_history_limit': None,
+        }
+        cache = self.make()
+        cache.restore(snap)
+        snap['discard_history'].append({'event': 'z', 'reason': 'queue_full', 'timestamp': 6})
+        source['event'] = 'mutated'
+        history = cache.discard_history()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].event, 'e')  # 源映射的后续变更不影响恢复结果
+
+    def test_round_trip_preserves_history(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        self.now[0] = 105
+        cache.push('d2', 'e2', 100)   # 挤出 e1 -> queue_full @105
+        self.assertEqual(cache.pop(), 'e2')  # 消费不写历史，腾出槽位
+        cache.push_expiring('d3', 'x', 100, 0)  # 接受点 105 即到期
+        self.now[0] = 120
+        cache.cleanup_expired_events()  # x -> event_ttl @120
+        snap1 = cache.snapshot()
+        rebuilt = self.make(discard_history_limit=99)
+        rebuilt.restore(snap1)
+        self.assertEqual(rebuilt.snapshot(), snap1)
+        self.assertEqual([(h.event, h.reason, h.timestamp) for h in rebuilt.discard_history()],
+                         [('e1', 'queue_full', 105), ('x', 'event_ttl', 120)])
+
+    def test_round_trip_with_finite_limit(self):
+        cache = self.make(discard_history_limit=2)
+        for i in range(4):
+            cache.push_expiring('d%d' % i, i, 100, 0)
+            self.now[0] += 1
+            cache.cleanup_expired_events()
+        self.assertEqual([h.event for h in cache.discard_history()], [2, 3])
+        rebuilt = self.make()
+        rebuilt.restore(cache.snapshot())
+        self.assertEqual(rebuilt.discard_history_limit, 2)
+        self.assertEqual([h.event for h in rebuilt.discard_history()], [2, 3])
+
+    def test_restore_trims_history_exceeding_manual_snapshot_limit(self):
+        # 手工构造的快照：容量 2 却给了 3 条 -> 只恢复最近 2 条
+        cache = self.make()
+        cache.restore({
+            'values': {}, 'events': [], 'seen': {}, 'max_queue': None,
+            'discard_history': [
+                {'event': 'a', 'reason': 'event_ttl', 'timestamp': 1},
+                {'event': 'b', 'reason': 'queue_full', 'timestamp': 2},
+                {'event': 'c', 'reason': 'event_ttl', 'timestamp': 3},
+            ],
+            'discard_history_limit': 2,
+        })
+        self.assertEqual([h.event for h in cache.discard_history()], ['b', 'c'])
+
+    def test_restore_zero_limit_with_entries_gives_empty_history(self):
+        cache = self.make()
+        cache.restore({
+            'values': {}, 'events': [], 'seen': {}, 'max_queue': None,
+            'discard_history': [{'event': 'a', 'reason': 'event_ttl', 'timestamp': 1}],
+            'discard_history_limit': 0,
+        })
+        self.assertEqual(cache.discard_history(), [])
+        self.assertEqual(cache.discard_history_limit, 0)
+
+    # ---- restore 校验失败：原子、不读时钟 ----
+    def assert_rejected_preserving_history(self, bad):
+        # 每次断言重建种子状态：时钟重置回 100，保证 seed_history 内 e1 的
+        # 到期点 105 确实早于清理时刻 110（共享时钟会在上一轮停在 110）
+        self.now[0] = 100
+        cache = self.make()
+        self.seed_history(cache)
+        before = [self.triple(h) for h in cache.discard_history()]
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            cache.restore(bad)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], before)
+        self.assertEqual(cache.queue_status().size, 1)  # e2 仍在队
+
+    def triple(self, entry):
+        return (entry.event, entry.reason, entry.timestamp)
+
+    def base(self, **extra):
+        snap = {'values': {}, 'events': [], 'seen': {}, 'max_queue': None}
+        snap.update(extra)
+        return snap
+
+    def test_restore_rejects_bad_history_container(self):
+        for raw in ((), {}, 'x', 42):
+            self.assert_rejected_preserving_history(self.base(discard_history=raw))
+
+    def test_restore_rejects_bad_history_entry_structure(self):
+        for entry in (
+            'not-a-mapping',
+            ('e', 'event_ttl', 1),                    # 非映射
+            {'event': 'e', 'reason': 'event_ttl'},    # 缺 timestamp
+            {'event': 'e', 'timestamp': 1},           # 缺 reason
+            {'reason': 'event_ttl', 'timestamp': 1},  # 缺 event
+            {'event': 'e', 'reason': 'event_ttl', 'timestamp': 1, 'x': 2},  # 多余字段
+        ):
+            self.assert_rejected_preserving_history(self.base(discard_history=[entry]))
+
+    def test_restore_rejects_bad_reason(self):
+        for reason in ('expired', 'ttl', 'dedupe_window', None, 1, True):
+            self.assert_rejected_preserving_history(self.base(discard_history=[
+                {'event': 'e', 'reason': reason, 'timestamp': 1}]))
+
+    def test_restore_rejects_bad_timestamp(self):
+        for ts in (True, False, None, '1', float('nan'), float('inf'),
+                   -float('inf'), 1.0j, [1]):
+            self.assert_rejected_preserving_history(self.base(discard_history=[
+                {'event': 'e', 'reason': 'event_ttl', 'timestamp': ts}]))
+
+    def test_restore_accepts_negative_and_float_timestamps(self):
+        cache = self.make()
+        cache.restore(self.base(discard_history=[
+            {'event': 'a', 'reason': 'event_ttl', 'timestamp': -5},
+            {'event': 'b', 'reason': 'queue_full', 'timestamp': 2.5},
+        ]))
+        self.assertEqual([h.timestamp for h in cache.discard_history()], [-5, 2.5])
+
+    def test_restore_rejects_bad_history_limit(self):
+        for limit in (-1, True, False, 1.5, 2.0, '3', []):
+            self.assert_rejected_preserving_history(
+                self.base(discard_history=[], discard_history_limit=limit))
+
+    def test_restore_rejects_unknown_field_alongside_history(self):
+        self.assert_rejected_preserving_history(
+            self.base(discard_history=[], bogus=1))
+
+    def test_failed_restore_keeps_history_functional(self):
+        cache = self.make()
+        self.seed_history(cache)
+        with self.assertRaises(ValueError):
+            cache.restore(self.base(discard_history='nope'))
+        # 历史与队列仍可继续使用并继续累积
+        cache.clear_discard_history()
+        cache.push_expiring('d9', 'new', 100, 0)
+        cache.cleanup_expired_events()
+        self.assertEqual([h.event for h in cache.discard_history()], ['new'])
+
+
+class DiscardHistoryReplayTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, **kwargs):
+        return EventCache(self.clock, **kwargs)
+
+    def triple(self, entry):
+        return (entry.event, entry.reason, entry.timestamp)
+
+    def test_replay_ttl_cleanup_and_eviction_use_record_timestamps(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        results = cache.replay_batch([
+            (10, ('push_expiring', 'd1', 'old', 100, 0)),  # 10 接受即到期
+            (20, ('cleanup_expired_events',)),              # old -> event_ttl @20
+            (20, ('push', 'd2', 'a', 100)),
+            (30, ('push', 'd3', 'b', 100)),                 # 挤出 a -> queue_full @30
+            (40, ('discard_expired_events',)),              # 无到期事件
+        ])
+        self.assertEqual(results[1].events_removed, 1)
+        self.assertTrue(results[3].accepted)
+        self.assertEqual(self.clock_calls[0], 0)  # 全程不读注入时钟
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], [
+            ('old', 'event_ttl', 20),
+            ('a', 'queue_full', 30),
+        ])
+
+    def test_replay_discard_expired_events_records_history(self):
+        cache = self.make()
+        cache.replay_batch([
+            (0, ('push_expiring', 'd1', 'x1', 10, 1)),
+            (0, ('push', 'd2', 'a', 10)),
+            (0, ('push_expiring', 'd3', 'x2', 10, 1)),
+        ])
+        r = cache.replay_batch([(5, ('discard_expired_events',))])
+        self.assertEqual([d.event for d in r[0].discarded], ['x1', 'x2'])
+        self.assertEqual([self.triple(h) for h in cache.discard_history()], [
+            ('x1', 'event_ttl', 5),
+            ('x2', 'event_ttl', 5),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_replay_pop_live_batch_records_history_but_pop_does_not(self):
+        cache = self.make()
+        cache.replay_batch([
+            (0, ('push_expiring', 'd1', 'x', 10, 1)),
+            (0, ('push', 'd2', 'a', 10)),
+            (5, ('pop_live_batch', None)),   # x 过期 -> 历史 @5
+        ])
+        self.assertEqual([self.triple(h) for h in cache.discard_history()],
+                         [('x', 'event_ttl', 5)])
+        # 普通 pop / pop_batch 即使取出已到期事件也不写历史
+        cache2 = self.make()
+        cache2.replay_batch([
+            (0, ('push_expiring', 'd1', 'x', 10, 0)),
+            (0, ('push', 'd2', 'a', 10)),
+            (9, ('pop',)),
+            (9, ('pop_batch', None)),
+        ])
+        self.assertEqual(cache2.discard_history(), [])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_replay_rejections_do_not_record_history(self):
+        cache = self.make(max_queue=1)  # reject_new
+        cache.replay_batch([
+            (0, ('push', 'd1', 'e1', 100)),
+            (1, ('push', 'd2', 'e2', 100)),   # queue_full 拒绝
+            (2, ('push', 'd1', 'dup', 100)),  # dedupe_window 拒绝
+        ])
+        self.assertEqual(cache.discard_history(), [])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_replay_peek_live_batch_does_not_record_history(self):
+        cache = self.make()
+        cache.replay_batch([
+            (0, ('push_expiring', 'd', 'x', 10, 0)),
+            (5, ('peek_live_batch', None)),
+        ])
+        self.assertEqual(cache.discard_history(), [])
+        self.assertEqual(cache.queue_status().size, 1)
+
+    def test_replay_cleanup_all_expired_records_event_history(self):
+        cache = self.make()
+        cache.replay_batch([
+            (0, ('put', 'k', 'v', 5)),
+            (0, ('push_expiring', 'd', 'e', 10, 5)),
+            (10, ('cleanup_all_expired',)),
+        ])
+        self.assertEqual([self.triple(h) for h in cache.discard_history()],
+                         [('e', 'event_ttl', 10)])
+
+    def test_replay_history_matches_live_calls(self):
+        # 同样的操作序列：一路实时调用、一路逻辑时间回放，历史应逐项一致
+        def build_live():
+            c = EventCache(lambda: live_now[0], max_queue=1, overflow_policy='drop_oldest')
+            live_now[0] = 10
+            c.push_expiring('d1', 'old', 100, 0)
+            live_now[0] = 20
+            c.cleanup_expired_events()
+            c.push('d2', 'a', 100)
+            live_now[0] = 30
+            c.push('d3', 'b', 100)
+            return c
+
+        live_now = [0]
+        live = build_live()
+        replayed = self.make(max_queue=1, overflow_policy='drop_oldest')
+        replayed.replay_batch([
+            (10, ('push_expiring', 'd1', 'old', 100, 0)),
+            (20, ('cleanup_expired_events',)),
+            (20, ('push', 'd2', 'a', 100)),
+            (30, ('push', 'd3', 'b', 100)),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)
+        live_hist = [(h.event, h.reason, h.timestamp) for h in live.discard_history()]
+        replay_hist = [(h.event, h.reason, h.timestamp) for h in replayed.discard_history()]
+        self.assertEqual(live_hist, replay_hist)
+        self.assertEqual(live_hist, [('old', 'event_ttl', 20), ('a', 'queue_full', 30)])
+
+    def test_replay_history_survives_snapshot_restore_round_trip(self):
+        cache = self.make()
+        cache.replay_batch([
+            (10, ('push_expiring', 'd', 'e', 10, 5)),
+            (20, ('cleanup_expired_events',)),
+        ])
+        snap = cache.snapshot()
+        rebuilt = self.make(discard_history_limit=99)
+        rebuilt.replay_batch([])  # 确保不读时钟也无副作用
+        rebuilt.restore(snap)
+        self.assertEqual([self.triple(h) for h in rebuilt.discard_history()],
+                         [('e', 'event_ttl', 20)])
 
 
 if __name__ == '__main__':

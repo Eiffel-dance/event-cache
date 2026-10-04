@@ -3,10 +3,16 @@ from collections import deque
 from collections.abc import Mapping
 
 _SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
-# 可选字段：event_expiries（事件 TTL 对齐信息）与 overflow_policy（溢出策略）
-_SNAPSHOT_FIELDS_ALL = _SNAPSHOT_FIELDS | frozenset(('event_expiries', 'overflow_policy'))
+# 可选字段：event_expiries（事件 TTL 对齐信息）、overflow_policy（溢出策略）、
+# discard_history（丢弃审计历史）与 discard_history_limit（历史容量）
+_SNAPSHOT_FIELDS_ALL = _SNAPSHOT_FIELDS | frozenset((
+    'event_expiries', 'overflow_policy', 'discard_history', 'discard_history_limit'))
 
 _OVERFLOW_POLICIES = frozenset(('reject_new', 'drop_oldest'))
+
+# 丢弃审计历史只记录两种原因：事件 TTL 到期清理与 drop_oldest 队首挤出
+_DISCARD_REASONS = frozenset(('event_ttl', 'queue_full'))
+_DISCARD_ENTRY_FIELDS = frozenset(('event', 'reason', 'timestamp'))
 
 
 class Result(dict):
@@ -67,6 +73,14 @@ def _check_max_queue(value):
         return
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError('max_queue must be None or a non-negative integer')
+
+
+def _check_discard_history_limit(value):
+    """discard_history_limit 必须是 None 或非 bool 的非负整数。"""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError('discard_history_limit must be None or a non-negative integer')
 
 
 def _check_overflow_policy(value):
@@ -286,17 +300,25 @@ def _parse_snapshot(snapshot):
     """在读取时钟或改变任何状态前完整解析并校验快照。
 
     快照必须是含 values、events、seen、max_queue 四个字段的映射，可在此
-    基础上增加与 events 对齐的 event_expiries 字段和/或 overflow_policy
-    字段：values 为 key -> (value, expires_at) 的映射，seen 为去重键 ->
+    基础上增加与 events 对齐的 event_expiries 字段、overflow_policy 字段
+    以及丢弃审计历史的 discard_history / discard_history_limit 字段：
+    values 为 key -> (value, expires_at) 的映射，seen 为去重键 ->
     绝对到期时间的映射，events 为事件列表（按 FIFO 顺序），max_queue 为
     None 或非负整数，event_expiries 为与 events 等长的列表，每项为
     None（无事件 TTL）或有限的绝对到期时刻，overflow_policy 为
     'reject_new' 或 'drop_oldest'（缺省时按 'reject_new' 解释，旧四字段
-    与五字段快照因此保持兼容）。三类到期时间（values 的 expires_at、seen
-    的到期时刻、event_expiries 的非 None 项）都只能是非 bool 的有限
-    int/float，允许负数与已过期时刻，不解释为相对时长。字段缺失或多余、
-    非映射/列表容器、二元组结构不符、event_expiries 长度不一致、
-    overflow_policy 非法或任一到期值为 NaN/无穷/字符串/复合对象、
+    与五字段快照因此保持兼容），discard_history 为按丢弃先后排列的列表，
+    每项必须是恰好含 event、reason、timestamp 三个字段的映射：reason 只能
+    是 'event_ttl' 或 'queue_full'，timestamp 只能是非 bool 的有限
+    int/float（允许负数），event 可为任意对象（含 None）；
+    discard_history_limit 为 None 或非负整数。两个历史字段均可省略：
+    缺 discard_history 按空历史解释，缺 discard_history_limit 按无限容量
+    解释，只给出其一时另一项按缺省解释。三类到期时间（values 的
+    expires_at、seen 的到期时刻、event_expiries 的非 None 项）都只能是非
+    bool 的有限 int/float，允许负数与已过期时刻，不解释为相对时长。字段
+    缺失或多余、非映射/列表容器、二元组结构不符、event_expiries 长度不
+    一致、overflow_policy 非法、历史条目结构/原因/时间戳非法、
+    discard_history_limit 非法或任一到期值为 NaN/无穷/字符串/复合对象、
     max_queue 非法时统一抛出 ValueError；键不可哈希时原样抛出 TypeError。
     校验期间一次性物化为全新的 dict/list/deque，供调用方随后整体替换状态。
     """
@@ -348,14 +370,46 @@ def _parse_snapshot(snapshot):
     # 缺省按 'reject_new' 解释；显式给出时校验合法性
     overflow_policy = snapshot.get('overflow_policy', 'reject_new')
     _check_overflow_policy(overflow_policy)
-    return values, events, event_expiries, seen, snapshot['max_queue'], overflow_policy
+    # 丢弃审计历史：缺字段按空历史解释；给出时逐条校验结构并物化为独立 Result
+    discard_history = deque()
+    if 'discard_history' in snapshot:
+        raw_history = snapshot['discard_history']
+        if not isinstance(raw_history, list):
+            raise ValueError('snapshot discard_history must be a list')
+        for entry in raw_history:
+            if not isinstance(entry, Mapping) or frozenset(entry.keys()) != _DISCARD_ENTRY_FIELDS:
+                raise ValueError(
+                    'each discard_history entry must be a mapping with event, reason, timestamp')
+            reason = entry['reason']
+            if not isinstance(reason, str) or reason not in _DISCARD_REASONS:
+                raise ValueError("discard_history reason must be 'event_ttl' or 'queue_full'")
+            timestamp = entry['timestamp']
+            _check_expiry(timestamp, 'discard_history timestamp')
+            # 事件对象按既有接口语义保留引用，条日本身物化为全新 Result
+            discard_history.append(
+                Result(event=entry['event'], reason=reason, timestamp=timestamp))
+    # 缺字段按无限容量解释；显式给出时校验 None / 非负整数（拒绝布尔）
+    discard_history_limit = snapshot.get('discard_history_limit', None)
+    _check_discard_history_limit(discard_history_limit)
+    if discard_history_limit is not None and len(discard_history) > discard_history_limit:
+        # 与构造容量保持同一不变量：只保留最近的记录（缓存自身产生的快照
+        # 总已满足该不变量，此处仅规范手工构造的快照）。注意 -0 == 0，
+        # 不能用 [-0:]（等价于整个列表），零容量需显式清空。
+        if discard_history_limit == 0:
+            discard_history = deque()
+        else:
+            discard_history = deque(list(discard_history)[-discard_history_limit:])
+    return (values, events, event_expiries, seen, snapshot['max_queue'],
+            overflow_policy, discard_history, discard_history_limit)
 
 
 class EventCache:
-    def __init__(self, clock, max_queue=None, overflow_policy='reject_new'):
+    def __init__(self, clock, max_queue=None, overflow_policy='reject_new',
+                 discard_history_limit=None):
         # 策略与容量在校验通过前不触碰任何状态，也不读取时钟
         _check_max_queue(max_queue)
         _check_overflow_policy(overflow_policy)
+        _check_discard_history_limit(discard_history_limit)
         self.clock = clock
         self.max_queue = max_queue
         self.overflow_policy = overflow_policy
@@ -364,6 +418,21 @@ class EventCache:
         # 与 events 逐元素对齐：None 表示无事件 TTL，否则为绝对到期时刻
         self.event_expiries = deque()
         self.seen = {}
+        # 丢弃审计历史：按丢弃先后排列，每项为含
+        # event/reason/timestamp 的独立 Result；None 容量表示无限
+        self._discard_history = deque()
+        self.discard_history_limit = discard_history_limit
+
+    def _record_discard(self, event, reason, now):
+        # 追加一条丢弃审计记录。now 是触发该丢弃动作的那次观察时刻，由
+        # 调用方显式传入（实时路径为当时钟读数，回放路径为记录时间戳），
+        # 本方法自身绝不读取注入时钟。历史容量有限时先淘汰最早记录；容量
+        # 为零时 deque 追加后立即弹出，效果为不留存。事件为 None 同样记录。
+        history = self._discard_history
+        history.append(Result(event=event, reason=reason, timestamp=now))
+        limit = self.discard_history_limit
+        if limit is not None and len(history) > limit:
+            history.popleft()
 
     def _put_at(self, key, value, ttl, now):
         # 以写入时刻加 ttl 记录到期点，并替换同 key 旧值；ttl 由调用方先行校验
@@ -455,13 +524,15 @@ class EventCache:
     def _cleanup_events_at(self, now):
         # 在指定时刻移除所有已到期的带 TTL 事件；到期边界与 values/seen 一致：
         # 到期点 <= 当前时刻即移除。未到期事件与未设置事件 TTL 的旧事件一律
-        # 保留且相对顺序不变；values、seen 与 max_queue 不受影响。
+        # 保留且相对顺序不变；values、seen 与 max_queue 不受影响。每个被移除
+        # 事件按触发清理的观察时刻 now 追加一条 reason='event_ttl' 的审计历史。
         kept_events = deque()
         kept_expiries = deque()
         events_removed = 0
         for event, expiry in zip(self.events, self.event_expiries):
             if expiry is not None and expiry <= now:
                 events_removed += 1
+                self._record_discard(event, 'event_ttl', now)
             else:
                 kept_events.append(event)
                 kept_expiries.append(expiry)
@@ -474,7 +545,9 @@ class EventCache:
 
         到期边界与 values/seen 一致：到期点 <= 当前时刻即移除。未到期事件
         与未设置事件 TTL 的旧事件一律保留且相对顺序不变；values、seen 与
-        max_queue 不受影响。返回 Result(events_removed=移除数量)。
+        max_queue 不受影响。返回 Result(events_removed=移除数量)。每个被
+        移除事件以本次时钟读数为 timestamp 追加一条 reason='event_ttl' 的
+        丢弃审计历史（受 discard_history_limit 容量约束）。
         """
         now = self.clock()
         return Result(events_removed=self._cleanup_events_at(now))
@@ -490,8 +563,10 @@ class EventCache:
         discarded = []
         for event, expiry in zip(self.events, self.event_expiries):
             if expiry is not None and expiry <= now:
-                # 事件值为 None 也保留该条丢弃记录
-                discarded.append(Result(event=event, reason='event_ttl'))
+                # 事件值为 None 也保留该条丢弃记录；同时写入审计历史
+                record = Result(event=event, reason='event_ttl')
+                discarded.append(record)
+                self._record_discard(event, 'event_ttl', now)
             else:
                 kept_events.append(event)
                 kept_expiries.append(expiry)
@@ -512,7 +587,10 @@ class EventCache:
         去重窗口。返回 Result(events_removed=移除数量, discarded=丢弃记录
         列表)，discarded 中每项为 Result(event=原事件值, reason='event_ttl')，
         顺序与被删除事件一致，事件值为 None 时同样保留该条记录；没有新的
-        到期事件时重复调用返回零计数和空列表。
+        到期事件时重复调用返回零计数和空列表。每个被移除事件还会以本次观察
+        时刻为 timestamp 追加一条 reason='event_ttl' 的丢弃审计历史（受
+        构造时 discard_history_limit 容量约束），discarded 返回形状不包含
+        timestamp。
         """
         now = self.clock()
         discarded = self._discard_expired_events_at(now)
@@ -536,7 +614,9 @@ class EventCache:
         延长对应 seen 去重窗口，清理值与去重记录不触碰队列。没有可清理项
         时返回三个零，仍只读取一次时钟；时钟抛出的异常原样传播且状态保持
         不变。返回 Result(values_removed=, dedupe_removed=, events_removed=)，
-        计数反映本次调用实际删除的记录，重复调用得到零计数。
+        计数反映本次调用实际删除的记录，重复调用得到零计数。被清理的带 TTL
+        事件同样以该观察时刻追加 reason='event_ttl' 的丢弃审计历史，值记录
+        与去重记录的清理不写历史。
         """
         now = self.clock()
         values_removed, dedupe_removed, events_removed = self._cleanup_all_at(now)
@@ -561,8 +641,10 @@ class EventCache:
                 # 去重记录保留到原窗口截止，不在此删除
                 evicted = self.events.popleft()
                 self.event_expiries.popleft()
-                # 事件值为 None 也保留该条丢弃记录
+                # 事件值为 None 也保留该条丢弃记录；审计历史固定 reason='queue_full'，
+                # 时间戳取触发本次入队判定的观察时刻 now
                 discarded.append(Result(event=evicted, reason='queue_full'))
+                self._record_discard(evicted, 'queue_full', now)
             else:
                 # 去重已可用但队列已满：拒绝且不登记新的去重占用；
                 # max_queue 为零时 drop_oldest 同样拒绝且不丢弃任何项目
@@ -692,7 +774,13 @@ class EventCache:
         ('queue_status',)。每条记录以自己的 timestamp 作为当前时刻计算
         TTL、event_ttl 与去重窗口的绝对边界，同一时间戳共享该边界；回放
         全程不读取注入时钟、不启动后台线程，记录时间的推进本身不触发
-        values/seen/事件的任何自动清理。
+        values/seen/事件的任何自动清理。溢出挤出（drop_oldest 的
+        queue_full）、事件 TTL 清理（cleanup_expired_events、
+        discard_expired_events、cleanup_all_expired）与过期感知出队
+        （pop_live_batch）产生的丢弃审计历史与实时调用完全一致：按操作
+        顺序追加，timestamp 取各记录自带时间戳而非注入时钟；普通
+        pop/pop_batch、reject_new 的 queue_full 拒绝与 dedupe_window
+        拒绝同样不写历史。
 
         读取与出队记录的时间语义与对应公开入口一致：get 按记录时刻判定
         键值 TTL，到期点 <= 记录时刻时返回 None 并移除该键（键不存在同样
@@ -866,6 +954,8 @@ class EventCache:
             if expiry is not None and expiry <= now:
                 # 到期边界与 values/seen/cleanup_expired_events 一致：<= 即过期
                 discarded.append(Result(event=event, reason='event_ttl'))
+                # 过期感知出队同样属于 event_ttl 清理，写入审计历史
+                self._record_discard(event, 'event_ttl', now)
             else:
                 events.append(event)
                 if limit is not None and len(events) >= limit:
@@ -886,7 +976,10 @@ class EventCache:
         仍占用原 max_queue 槽位；为 0 时不读取时钟也不改变状态，直接返回两个
         空列表。队列为空时同样不读取时钟。被移除的过期事件与返回的有效事件
         一样释放队列槽位，但两者都不触碰 values 与 seen：过期事件的去重记录
-        保留到原去重窗口截止，下一次相同去重键继续遵循既有判定。
+        保留到原去重窗口截止，下一次相同去重键继续遵循既有判定。每个被移除
+        的过期事件还按扫描顺序以本次时钟读数为 timestamp 追加一条
+        reason='event_ttl' 的丢弃审计历史；返回的 discarded 条目仍只有
+        event/reason 两字段。
 
         limit 不是 None 且不是非 bool 的非负整数（负数、浮点数、字符串、
         布尔值等）时抛出 ValueError，抛出前不读取时钟、不改变任何状态；时钟
@@ -949,6 +1042,49 @@ class EventCache:
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
 
+    def discard_history(self, limit=None):
+        """返回丢弃审计历史的独立副本，按丢弃先后排列。
+
+        只记录两类丢弃：事件因 event_ttl 到期被清理
+        （cleanup_expired_events、discard_expired_events、
+        cleanup_all_expired、apply_batch/replay_batch 中的对应操作以及
+        pop_live_batch 的过期感知出队），原因固定为 'event_ttl'；
+        drop_oldest 策略下入队从队首挤出事件，原因固定为 'queue_full'。
+        普通 pop/pop_batch 消费、reject_new 下的 queue_full 拒绝与
+        dedupe_window 拒绝一律不写历史。每项为
+        Result(event=原事件值, reason=原因, timestamp=触发该丢弃动作的那次
+        观察时刻)：实时路径取当时钟读数，回放路径取记录自带时间戳；批次
+        内按操作顺序追加，事件为 None 同样记录。
+
+        limit 为 None（缺省）时返回全部历史；为非负整数时只返回最近的该
+        数量，不足时返回实际存在的记录，零返回空列表。纯查询：不读取
+        时钟、不触发清理、不改变队列或历史，返回的列表及其中 Result 均为
+        与内部状态分离的独立副本（事件对象按既有接口语义保留引用）。
+        limit 为负数、浮点数、字符串、布尔值或其他非整数时抛出
+        ValueError，抛出前不读取时钟、不改变任何状态。
+        """
+        _check_limit(limit)
+        history = self._discard_history
+        if limit is None:
+            start = 0
+        else:
+            start = len(history) - limit
+            if start < 0:
+                start = 0
+        # 逐项物化为全新 Result，返回列表与内部 deque 相互独立
+        return [Result(event=entry.event, reason=entry.reason, timestamp=entry.timestamp)
+                for entry in list(history)[start:]]
+
+    def clear_discard_history(self):
+        """清空丢弃审计历史并返回被清除的记录数量。
+
+        纯状态操作：不读取时钟、不触发清理、不触碰 values/events/seen/
+        max_queue 与历史容量配置；历史为空时返回 0。
+        """
+        removed = len(self._discard_history)
+        self._discard_history.clear()
+        return removed
+
     def snapshot(self):
         """捕获某一时刻的可检查、可恢复状态快照。
 
@@ -957,8 +1093,13 @@ class EventCache:
         时返回只含 values、events、seen、max_queue 四个字段的 Result；存在带
         TTL 事件时增加与 events 对齐的 event_expiries 字段，无 TTL 的旧事件
         以 None 表示；overflow_policy 非默认（'drop_oldest'）时增加同名字段。
-        外层字典与事件列表均为与缓存分离的副本，随后任一方增删都不会
-        影响另一方；value 与事件对象按既有接口语义保留引用。
+        丢弃审计历史非空或历史容量非默认（非 None）时增加 discard_history
+        （按丢弃先后排列的条目列表，每项为含 event、reason、timestamp 的
+        Result）与 discard_history_limit（None 表示无限，否则为非负整数）
+        两个字段；容量有限但历史暂为空（如容量为零）时同样记录容量配置。
+        外层字典、事件列表与历史列表均为与缓存分离的副本，随后任一方增删
+        都不会影响另一方；value、事件对象与历史中的事件对象按既有接口语义
+        保留引用。
         """
         snap = Snapshot(
             values=dict(self.values),
@@ -970,25 +1111,39 @@ class EventCache:
             snap['event_expiries'] = list(self.event_expiries)
         if self.overflow_policy != 'reject_new':
             snap['overflow_policy'] = self.overflow_policy
+        if self._discard_history or self.discard_history_limit is not None:
+            # 逐项物化为全新 Result，历史列表与内部 deque 相互独立
+            snap['discard_history'] = [
+                Result(event=entry.event, reason=entry.reason, timestamp=entry.timestamp)
+                for entry in self._discard_history
+            ]
+            snap['discard_history_limit'] = self.discard_history_limit
         return snap
 
     def restore(self, snapshot):
-        """从快照一次性恢复 values、events、seen、max_queue（及事件到期信息与溢出策略）。
+        """从快照一次性恢复 values、events、seen、max_queue（及事件到期信息、溢出策略与丢弃历史）。
 
         先完整解析并校验快照：在此之前不读取时钟、不改变任何状态，校验失败时
-        原状态、队列顺序和容量完全保持。接受不含 event_expiries 与
+        原状态、队列顺序、容量与丢弃历史完全保持。接受不含 event_expiries 与
         overflow_policy 的旧格式（恢复后所有事件均无 TTL，溢出策略按
-        'reject_new' 解释）、只含其一或两者皆含的新格式。成功后以副本整体
-        替换状态并返回 None，恢复出的容器与传入快照相互独立。恢复后一律
-        由本实例当前时间源按既有的 expiry <= now 边界判定过期，不隐式清理、
-        不释放队列槽位、不延长去重窗口。
+        'reject_new' 解释）、只含其一或两者皆含的新格式；discard_history 与
+        discard_history_limit 两个字段同样可选，缺前者按空历史、缺后者按
+        无限容量解释，旧快照因此保持兼容。历史条目必须是恰好含
+        event/reason/timestamp 的映射，reason 只能是 'event_ttl' 或
+        'queue_full'，timestamp 为非 bool 的有限 int/float，历史容量为
+        None 或非负整数，任一非法都抛出 ValueError 且保持原状态。成功后以
+        副本整体替换状态并返回 None，恢复出的容器（含历史）与传入快照相互
+        独立。恢复后一律由本实例当前时间源按既有的 expiry <= now 边界判定
+        过期，不隐式清理、不释放队列槽位、不延长去重窗口。
         """
-        values, events, event_expiries, seen, max_queue, overflow_policy = \
-            _parse_snapshot(snapshot)
+        (values, events, event_expiries, seen, max_queue, overflow_policy,
+         discard_history, discard_history_limit) = _parse_snapshot(snapshot)
         self.values = values
         self.events = events
         self.event_expiries = event_expiries
         self.seen = seen
         self.max_queue = max_queue
         self.overflow_policy = overflow_policy
+        self._discard_history = discard_history
+        self.discard_history_limit = discard_history_limit
         return None
