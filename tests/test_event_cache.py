@@ -3360,5 +3360,284 @@ class DiscardHistoryReplayTest(unittest.TestCase):
                          [('e', 'event_ttl', 20)])
 
 
+class ResizeQueueTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def make(self, max_queue=None, overflow_policy='reject_new', history_limit=None):
+        return EventCache(self.clock, max_queue=max_queue,
+                          overflow_policy=overflow_policy,
+                          discard_history_limit=history_limit)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def triple(self, entry):
+        return (entry.event, entry.reason, entry.timestamp)
+
+    def state(self, cache):
+        return (cache.max_queue, cache.overflow_policy,
+                dict(cache.values), list(cache.events),
+                list(cache.event_expiries), dict(cache.seen),
+                [self.triple(h) for h in cache.discard_history()])
+
+    # ---- 直接调用：扩容 / 保持容量 / 只换策略 ----
+    def test_grow_capacity_no_eviction_no_clock(self):
+        cache = self.make(max_queue=1)
+        cache.push('d1', 'e1', 100)
+        calls_before = self.clock_calls[0]
+        result = cache.resize_queue(5)
+        self.assertEqual(result, {'max_queue': 5, 'overflow_policy': 'reject_new',
+                                  'discarded': []})
+        self.assertEqual(result.keys(), {'max_queue', 'overflow_policy', 'discarded'})
+        self.assertEqual(self.clock_calls[0], calls_before)  # 无挤出不读时钟
+        self.assertEqual(list(cache.events), ['e1'])
+        self.assertEqual(cache.max_queue, 5)
+
+    def test_keep_capacity_and_unlimited_resize_do_not_evict(self):
+        cache = self.make(max_queue=2)
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        calls_before = self.clock_calls[0]
+        result = cache.resize_queue(2)  # 保持容量
+        self.assertEqual(result.discarded, [])
+        result = cache.resize_queue(None)  # 改为无限
+        self.assertIsNone(result.max_queue)
+        self.assertEqual(result.discarded, [])
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(list(cache.events), ['e1', 'e2'])
+
+    def test_change_policy_only_keeps_everything(self):
+        cache = self.make(max_queue=2)
+        cache.put('k', 'v', 50)
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        calls_before = self.clock_calls[0]
+        result = cache.resize_queue(2, 'drop_oldest')
+        self.assertEqual(result, {'max_queue': 2, 'overflow_policy': 'drop_oldest',
+                                  'discarded': []})
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(list(cache.events), ['e1', 'e2'])
+        self.assertEqual(cache.overflow_policy, 'drop_oldest')
+        self.assertEqual(cache.get('k'), 'v')
+
+    def test_omitted_policy_keeps_current(self):
+        cache = self.make(max_queue=5, overflow_policy='drop_oldest')
+        result = cache.resize_queue(3)
+        self.assertEqual(result.overflow_policy, 'drop_oldest')
+        self.assertEqual(cache.overflow_policy, 'drop_oldest')
+
+    # ---- 直接调用：缩容挤出 ----
+    def test_shrink_evicts_fifo_head_in_order(self):
+        cache = self.make()
+        for i in range(4):
+            cache.push('d%d' % i, 'e%d' % i, 100)
+        calls_before = self.clock_calls[0]
+        result = cache.resize_queue(2)
+        self.assertEqual(self.clock_calls[0], calls_before + 1)  # 只读一次时钟
+        self.assertEqual([(d.event, d.reason) for d in result.discarded],
+                         [('e0', 'queue_full'), ('e1', 'queue_full')])
+        self.assertEqual(list(cache.events), ['e2', 'e3'])
+        self.assertEqual(len(cache.event_expiries), 2)
+        self.assertEqual(cache.max_queue, 2)
+        # 挤出写入审计历史，时间戳取本次唯一时钟读数
+        self.assertEqual([self.triple(h) for h in cache.discard_history()],
+                         [('e0', 'queue_full', 100), ('e1', 'queue_full', 100)])
+
+    def test_shrink_to_zero_evicts_all(self):
+        cache = self.make()
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', None, 100)  # None 事件同样保留丢弃记录
+        result = cache.resize_queue(0)
+        self.assertEqual([(d.event, d.reason) for d in result.discarded],
+                         [('e1', 'queue_full'), (None, 'queue_full')])
+        self.assertEqual(list(cache.events), [])
+        self.assertEqual(list(cache.event_expiries), [])
+        self.assertEqual(cache.max_queue, 0)
+
+    def test_shrink_removes_event_expiries_but_keeps_seen(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 100, 500)
+        cache.push('d2', 'e2', 100)
+        cache.resize_queue(1)
+        self.assertEqual(list(cache.events), ['e2'])
+        self.assertEqual(len(cache.event_expiries), 1)
+        # 被挤出事件的 seen 保留到原窗口截止：窗口内同键仍被去重
+        # （去重优先于容量判定，reason 确为 dedupe_window）
+        self.assertEqual(cache.push_with_reason('d1', 'e1-again', 100).reason,
+                         'dedupe_window')
+        self.assertEqual(cache.pop(), 'e2')  # 腾出槽位，排除容量干扰
+        self.advance(100)  # 越过原窗口（到期点 200，<= 边界即可重新入队）
+        self.assertTrue(cache.push('d1', 'e1-again', 100))
+
+    def test_expired_events_count_toward_length_without_scan(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 100, 5)   # 到期点 105
+        cache.push('d2', 'e2', 100)
+        self.advance(10)  # e1 已过期但仍占槽位
+        result = cache.resize_queue(1)
+        # 过期事件照样计数并按 FIFO 挤出，reason 仍为 queue_full 而非 event_ttl
+        self.assertEqual([(d.event, d.reason) for d in result.discarded],
+                         [('e1', 'queue_full')])
+        self.assertEqual(list(cache.events), ['e2'])
+        self.assertEqual([h.reason for h in cache.discard_history()], ['queue_full'])
+
+    # ---- 直接调用：校验与异常 ----
+    def test_invalid_max_queue_raises_and_preserves_state(self):
+        cache = self.make(max_queue=3, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 100)
+        before = self.state(cache)
+        calls_before = self.clock_calls[0]
+        for bad in (-1, -100, True, False, 1.5, 2.0, '3', [], object()):
+            with self.assertRaises(ValueError):
+                cache.resize_queue(bad)
+        self.assertEqual(self.state(cache), before)
+        self.assertEqual(self.clock_calls[0], calls_before)  # 校验失败不读时钟
+
+    def test_invalid_policy_raises_and_preserves_state(self):
+        cache = self.make(max_queue=3)
+        cache.push('d1', 'e1', 100)
+        before = self.state(cache)
+        calls_before = self.clock_calls[0]
+        for bad in (None, 'x', 'REJECT_NEW', 0, 1.5, [], object()):
+            with self.assertRaises(ValueError):
+                cache.resize_queue(3, bad)
+        self.assertEqual(self.state(cache), before)
+        self.assertEqual(self.clock_calls[0], calls_before)
+
+    def test_clock_exception_propagates_without_state_change(self):
+        calls = [0]
+
+        def flaky_clock():
+            calls[0] += 1
+            if calls[0] > 2:  # 前两次供两次 push
+                raise RuntimeError('clock broken')
+            return 100
+
+        cache = EventCache(flaky_clock, max_queue=5)
+        cache.push('d1', 'e1', 100)
+        cache.push('d2', 'e2', 100)
+        with self.assertRaises(RuntimeError):
+            cache.resize_queue(1)
+        self.assertEqual(cache.max_queue, 5)
+        self.assertEqual(list(cache.events), ['e1', 'e2'])
+        self.assertEqual(list(cache.event_expiries), [None, None])
+        self.assertEqual(cache.discard_history(), [])
+
+    # ---- 直接调用：新配置立即生效并由快照表达 ----
+    def test_subsequent_push_uses_new_config(self):
+        cache = self.make(max_queue=3)
+        cache.resize_queue(1, 'drop_oldest')
+        cache.push('d1', 'e1', 100)
+        result = cache.push_with_reason('d2', 'e2', 100)
+        self.assertTrue(result.accepted)
+        self.assertEqual([(d.event, d.reason) for d in result.discarded],
+                         [('e1', 'queue_full')])
+        self.assertEqual(list(cache.events), ['e2'])
+        self.assertEqual(cache.queue_status(), {'size': 1, 'max_queue': 1})
+
+    def test_snapshot_reflects_new_config(self):
+        cache = self.make(max_queue=5)
+        cache.resize_queue(2, 'drop_oldest')
+        snap = cache.snapshot()
+        self.assertEqual(snap.max_queue, 2)
+        self.assertEqual(snap['overflow_policy'], 'drop_oldest')
+        restored = EventCache(self.clock)
+        restored.restore(snap)
+        self.assertEqual(restored.max_queue, 2)
+        self.assertEqual(restored.overflow_policy, 'drop_oldest')
+
+    # ---- apply_batch 中的 resize_queue ----
+    def test_apply_batch_resize_queue_in_order_single_clock(self):
+        cache = self.make()
+        results = cache.apply_batch([
+            ('push', 'd1', 'e1', 100),
+            ('push', 'd2', 'e2', 100),
+            ('resize_queue', 1, 'drop_oldest'),
+            ('push', 'd3', 'e3', 100),
+        ])
+        self.assertEqual(len(results), 4)
+        resize_result = results[2]
+        self.assertEqual(resize_result, {'max_queue': 1, 'overflow_policy': 'drop_oldest',
+                                         'discarded': resize_result.discarded})
+        self.assertEqual([(d.event, d.reason) for d in resize_result.discarded],
+                         [('e1', 'queue_full')])
+        # 后续 push 立即看到新配置：容量 1 + drop_oldest 挤出 e2
+        self.assertIs(results[3].accepted, True)
+        self.assertEqual([(d.event, d.reason) for d in results[3].discarded],
+                         [('e2', 'queue_full')])
+        self.assertEqual(list(cache.events), ['e3'])
+        self.assertEqual(self.clock_calls[0], 1)  # 整批共享一次时钟读数
+        # 批次内两类挤出都以批次观察时刻写入历史
+        self.assertEqual([self.triple(h) for h in cache.discard_history()],
+                         [('e1', 'queue_full', 100), ('e2', 'queue_full', 100)])
+
+    def test_apply_batch_resize_two_tuple_keeps_current_policy(self):
+        cache = self.make(overflow_policy='drop_oldest')
+        results = cache.apply_batch([('resize_queue', 7)])
+        self.assertEqual(results[0], {'max_queue': 7, 'overflow_policy': 'drop_oldest',
+                                      'discarded': []})
+        self.assertEqual(cache.overflow_policy, 'drop_oldest')
+
+    def test_apply_batch_invalid_resize_rejects_whole_batch(self):
+        cache = self.make(max_queue=9)
+        before = self.state(cache)
+        calls_before = self.clock_calls[0]
+        for bad_op in (('resize_queue', -1), ('resize_queue', True),
+                       ('resize_queue', 1.5), ('resize_queue', 2, 'x'),
+                       ('resize_queue', 2, None), ('resize_queue',),
+                       ('resize_queue', 1, 'drop_oldest', 'extra')):
+            with self.assertRaises(ValueError):
+                cache.apply_batch([('push', 'd1', 'e1', 100), bad_op])
+            self.assertEqual(self.state(cache), before)  # 整批不改状态
+        self.assertEqual(self.clock_calls[0], calls_before)  # 校验在读时钟前完成
+
+    # ---- replay_batch 中的 resize_queue ----
+    def test_replay_resize_uses_record_timestamp_without_clock(self):
+        cache = self.make()
+        cache.replay_batch([
+            (10, ('push', 'd1', 'e1', 100)),
+            (20, ('push', 'd2', 'e2', 100)),
+            (30, ('resize_queue', 1)),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)  # 回放全程不读注入时钟
+        self.assertEqual(list(cache.events), ['e2'])
+        self.assertEqual(cache.max_queue, 1)
+        self.assertEqual([self.triple(h) for h in cache.discard_history()],
+                         [('e1', 'queue_full', 30)])  # 时间戳取记录时刻
+
+    def test_replay_resize_subsequent_records_see_new_config(self):
+        cache = self.make(max_queue=1)
+        results = cache.replay_batch([
+            (10, ('push', 'd1', 'e1', 100)),
+            (20, ('push', 'd2', 'e2', 100)),          # 容量 1：拒绝
+            (30, ('resize_queue', 2)),
+            (40, ('push', 'd3', 'e3', 100)),          # 容量 2：接受
+            (50, ('queue_status',)),
+        ])
+        self.assertIs(results[1].accepted, False)
+        self.assertEqual(results[1].reason, 'queue_full')
+        self.assertIs(results[3].accepted, True)
+        self.assertEqual(results[4], {'size': 2, 'max_queue': 2})
+
+    def test_replay_invalid_resize_rejects_all_records(self):
+        cache = self.make(max_queue=9)
+        before = self.state(cache)
+        for bad_op in (('resize_queue', -1), ('resize_queue', 2, 'reject'),
+                       ('resize_queue',), ('resize_queue', 1, 'drop_oldest', 1)):
+            with self.assertRaises(ValueError):
+                cache.replay_batch([(1, ('push', 'd1', 'e1', 100)), (2, bad_op)])
+            self.assertEqual(self.state(cache), before)
+        self.assertEqual(self.clock_calls[0], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
