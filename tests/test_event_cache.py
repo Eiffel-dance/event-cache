@@ -4175,5 +4175,224 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(self.cache.peek_with_receipt(), [])
 
 
+class InspectTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.cache = EventCache(lambda: self.now[0])
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 基本形状与空容器 ----
+    def test_empty_cache_returns_full_fields(self):
+        result = self.cache.inspect()
+        self.assertEqual(result.observed_at, 100)
+        self.assertEqual(result.value_count, 0)
+        self.assertEqual(result.expired_value_count, 0)
+        self.assertEqual(result.dedupe_count, 0)
+        self.assertEqual(result.expired_dedupe_count, 0)
+        self.assertEqual(result.queue_size, 0)
+        self.assertEqual(result.live_event_count, 0)
+        self.assertEqual(result.expired_event_count, 0)
+        self.assertIsNone(result.next_value_expiry)
+        self.assertIsNone(result.next_dedupe_expiry)
+        self.assertIsNone(result.next_event_expiry)
+        self.assertEqual(result.discard_history_size, 0)
+        # 属性访问与键访问一致
+        self.assertEqual(result['value_count'], result.value_count)
+
+    def test_reads_clock_exactly_once(self):
+        calls = []
+        cache = EventCache(lambda: (calls.append(1), 100)[1])
+        result = cache.inspect()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.observed_at, 100)
+
+    # ---- 计数与边界 ----
+    def test_value_counts_and_expiry_boundary(self):
+        self.cache.put('live', 'v', 10)     # 到期点 110
+        self.cache.put('edge', 'v', 0)      # 到期点 100，<= observed_at 即过期
+        self.cache.put('soon', 'v', 5)      # 到期点 105
+        result = self.cache.inspect()
+        self.assertEqual(result.value_count, 2)
+        self.assertEqual(result.expired_value_count, 1)
+        self.assertEqual(result.next_value_expiry, 105)
+        # inspect 不删除到期记录
+        self.assertIn('edge', self.cache.values)
+
+    def test_dedupe_counts_and_next_expiry(self):
+        self.cache.push('d1', 'e1', 50)   # 去重窗口到 150
+        self.cache.push('d2', 'e2', 10)   # 去重窗口到 110
+        self.advance(20)                  # 现在 120：d2 窗口已到期但仍在 seen 中
+        result = self.cache.inspect()
+        self.assertEqual(result.observed_at, 120)
+        self.assertEqual(result.dedupe_count, 1)
+        self.assertEqual(result.expired_dedupe_count, 1)
+        self.assertEqual(result.next_dedupe_expiry, 150)
+        self.assertIn('d2', self.cache.seen)  # 到期记录不被清除
+
+    def test_event_counts_and_next_expiry(self):
+        self.cache.push('d1', 'no-ttl', 100)             # 无事件 TTL：始终 live
+        self.cache.push_expiring('d2', 'live', 100, 20)  # 到期点 120
+        self.cache.push_expiring('d3', 'gone', 100, 0)   # 到期点 100，已到期
+        result = self.cache.inspect()
+        self.assertEqual(result.queue_size, 3)
+        self.assertEqual(result.live_event_count, 2)
+        self.assertEqual(result.expired_event_count, 1)
+        self.assertEqual(result.next_event_expiry, 120)
+
+    def test_next_fields_none_when_no_future_expiry(self):
+        self.cache.put('a', 'v', 0)
+        self.cache.push('d', 'e', 0)
+        self.advance(10)
+        result = self.cache.inspect()
+        self.assertIsNone(result.next_value_expiry)
+        self.assertIsNone(result.next_dedupe_expiry)
+        self.assertIsNone(result.next_event_expiry)
+
+    def test_discard_history_size(self):
+        cache = EventCache(lambda: self.now[0], max_queue=1,
+                           overflow_policy='drop_oldest')
+        cache.push('d1', 'a', 100)
+        cache.push('d2', 'b', 100)  # 挤出 a
+        result = cache.inspect()
+        self.assertEqual(result.discard_history_size, 1)
+
+    # ---- 只读保证 ----
+    def test_inspect_does_not_change_state(self):
+        self.cache.put('a', 'v', 5)
+        self.cache.put('b', 'w', 50)
+        self.cache.push('d1', 'e1', 100)
+        self.cache.push_expiring('d2', 'e2', 100, 10)
+        self.advance(20)  # a 与 e2 已到期但仍占据容器
+        before = self.cache.snapshot()
+        self.cache.inspect()
+        after = self.cache.snapshot()
+        self.assertEqual(dict(before), dict(after))
+        # 后续读取/清理/出队与未调用 inspect 时一致
+        self.assertIsNone(self.cache.get('a'))          # 到期按原边界判定
+        self.assertEqual(self.cache.get('b'), 'w')
+        cleanup = self.cache.cleanup_all_expired()
+        self.assertEqual(cleanup.events_removed, 1)     # e2 仍在队列中被清理
+        self.assertEqual(self.cache.pop(), 'e1')        # FIFO 顺序不变
+
+    def test_inspect_does_not_consume_or_extend_anything(self):
+        self.cache.push('d', 'e', 10)
+        self.cache.inspect()
+        self.advance(15)
+        # 去重窗口未因 inspect 续期：窗口外可重新入队
+        self.assertTrue(self.cache.push('d', 'e2', 10))
+
+    # ---- 时钟异常与回退保护 ----
+    def test_clock_exception_propagates_and_preserves_state(self):
+        def boom():
+            raise RuntimeError('clock broken')
+
+        failing = EventCache(boom)
+        failing.values['a'] = ('v', 110)
+        with self.assertRaises(RuntimeError):
+            failing.inspect()
+        self.assertEqual(failing.values, {'a': ('v', 110)})
+
+    def test_reject_regression_raises_and_preserves_state(self):
+        cache = EventCache(lambda: self.now[0], clock_policy='reject_regression')
+        cache.put('a', 'v', 10)
+        cache.inspect()           # 水位推进到 100
+        self.now[0] = 50
+        with self.assertRaises(app.ClockRegressionError):
+            cache.inspect()
+        self.assertEqual(cache.clock_status().last_time, 100)
+        self.assertEqual(cache.values, {'a': ('v', 110)})
+
+    def test_reject_regression_successful_inspect_advances_watermark(self):
+        cache = EventCache(lambda: self.now[0], clock_policy='reject_regression')
+        cache.inspect()
+        self.assertEqual(cache.clock_status().last_time, 100)
+        self.advance(5)
+        result = cache.inspect()
+        self.assertEqual(result.observed_at, 105)
+        self.assertEqual(cache.clock_status().last_time, 105)
+
+    # ---- apply_batch 中的 inspect ----
+    def test_apply_batch_inspect_uses_batch_clock_and_reflects_prior_ops(self):
+        results = self.cache.apply_batch([
+            ('put', 'a', 'v', 10),
+            ('push', 'd1', 'e1', 50),
+            ('inspect',),
+            ('push_expiring', 'd2', 'e2', 50, 0),
+            ('inspect',),
+        ])
+        first, second = results[2], results[4]
+        self.assertEqual(first.observed_at, 100)
+        self.assertEqual(first.value_count, 1)
+        self.assertEqual(first.dedupe_count, 1)
+        self.assertEqual(first.queue_size, 1)
+        self.assertEqual(first.live_event_count, 1)
+        self.assertEqual(second.queue_size, 2)
+        self.assertEqual(second.live_event_count, 1)
+        self.assertEqual(second.expired_event_count, 1)
+        # 整批只读取一次时钟：两个 inspect 的 observed_at 相同
+        self.assertEqual(first.observed_at, second.observed_at)
+
+    def test_apply_batch_inspect_does_not_change_following_ops(self):
+        results = self.cache.apply_batch([
+            ('push', 'd1', 'e1', 10),
+            ('inspect',),
+            ('push', 'd1', 'e2', 10),   # 仍在去重窗口内：拒绝
+            ('cleanup',),
+        ])
+        self.assertFalse(results[2].accepted)
+        self.assertEqual(results[2].reason, 'dedupe_window')
+        self.assertEqual(results[3].values_removed, 0)
+        self.assertEqual(self.cache.pop(), 'e1')
+
+    def test_apply_batch_inspect_rejects_arguments(self):
+        with self.assertRaises(ValueError):
+            self.cache.apply_batch([('inspect', 1)])
+        with self.assertRaises(ValueError):
+            self.cache.apply_batch([('inspect',), ('inspect', 2)])
+
+    # ---- replay_batch 中的 inspect ----
+    def test_replay_batch_inspect_uses_record_timestamp(self):
+        calls = []
+        cache = EventCache(lambda: (calls.append(1), 999)[1])
+        results = cache.replay_batch([
+            (100, ('put', 'a', 'v', 10)),
+            (105, ('inspect',)),
+            (111, ('inspect',)),
+        ])
+        first, second = results[1], results[2]
+        self.assertEqual(first.observed_at, 105)
+        self.assertEqual(first.value_count, 1)      # 110 > 105：仍有效
+        self.assertEqual(first.next_value_expiry, 110)
+        self.assertEqual(second.observed_at, 111)
+        self.assertEqual(second.value_count, 0)     # 110 <= 111：已到期
+        self.assertEqual(second.expired_value_count, 1)
+        self.assertIsNone(second.next_value_expiry)
+        # 回放全程不读取注入时钟
+        self.assertEqual(calls, [])
+
+    def test_replay_batch_inspect_is_deterministic_and_pure(self):
+        records = [
+            (100, ('push_expiring', 'd1', 'e1', 50, 10)),
+            (105, ('inspect',)),
+            (105, ('inspect',)),
+            (120, ('pop',)),
+        ]
+        first_run = self.cache.replay_batch(records)
+        self.assertEqual(first_run[1], first_run[2])  # 同一记录序列相同结果
+        self.assertEqual(first_run[1].observed_at, 105)
+        self.assertEqual(first_run[1].live_event_count, 1)
+        # inspect 不移除事件：后续 pop 仍按 FIFO 取出
+        self.assertEqual(first_run[3], 'e1')
+        # 全新实例重放同一序列得到相同结果
+        other = EventCache(lambda: 0)
+        self.assertEqual(other.replay_batch(records), first_run)
+
+    def test_replay_batch_inspect_rejects_arguments(self):
+        with self.assertRaises(ValueError):
+            self.cache.replay_batch([(100, ('inspect', 1))])
+
+
 if __name__ == '__main__':
     unittest.main()
