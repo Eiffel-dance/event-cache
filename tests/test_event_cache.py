@@ -1554,7 +1554,7 @@ class SnapshotTest(unittest.TestCase):
         # 回执状态始终随快照保存：seed 入队了 e1、e2，回执为 1、2，下一个为 3
         self.assertEqual(set(snap), {
             'values', 'events', 'seen', 'max_queue',
-            'event_receipts', 'next_receipt'})
+            'event_receipts', 'next_receipt', 'event_metadata'})
         self.assertEqual(snap.max_queue, 3)
         self.assertEqual(snap['max_queue'], 3)
         self.assertEqual(snap.events, ['e1', 'e2'])
@@ -2099,7 +2099,7 @@ class ExpiringSnapshotTest(unittest.TestCase):
         snap = self.cache.snapshot()
         self.assertEqual(set(snap), {
             'values', 'events', 'seen', 'max_queue',
-            'event_receipts', 'next_receipt'})
+            'event_receipts', 'next_receipt', 'event_metadata'})
         self.assertEqual(snap.event_receipts, [1])
         self.assertEqual(snap.next_receipt, 2)
 
@@ -2110,7 +2110,7 @@ class ExpiringSnapshotTest(unittest.TestCase):
         snap = self.cache.snapshot()
         self.assertEqual(set(snap), {
             'values', 'events', 'seen', 'max_queue', 'event_expiries',
-            'event_receipts', 'next_receipt'})
+            'event_receipts', 'next_receipt', 'event_metadata'})
         self.assertEqual(snap.events, ['e1', 'e2', 'e3'])
         self.assertEqual(snap['event_expiries'], [None, 150, 105])
         self.assertEqual(snap.event_expiries, [None, 150, 105])  # 属性访问可用
@@ -2137,7 +2137,7 @@ class ExpiringSnapshotTest(unittest.TestCase):
         self.assertEqual(set(snap), {
             'values', 'events', 'seen', 'max_queue',
             'discard_history', 'discard_history_limit',
-            'event_receipts', 'next_receipt',
+            'event_receipts', 'next_receipt', 'event_metadata',
         })
         self.assertEqual(snap.events, ['plain'])
         self.assertEqual(snap.event_receipts, [2])
@@ -2183,7 +2183,7 @@ class ExpiringSnapshotTest(unittest.TestCase):
         # 恢复后再快照：回执两字段始终出现，旧事件仍以 None 对齐
         self.assertEqual(set(self.cache.snapshot()), {
             'values', 'events', 'seen', 'max_queue',
-            'event_receipts', 'next_receipt'})
+            'event_receipts', 'next_receipt', 'event_metadata'})
 
     def test_restore_copies_expiries_detached_from_snapshot(self):
         self.cache.push_expiring('d', 'e', 10, 50)
@@ -3407,7 +3407,7 @@ class DiscardHistorySnapshotTest(unittest.TestCase):
         cache.push('d', 'e', 100)
         self.assertEqual(set(cache.snapshot()), {
             'values', 'events', 'seen', 'max_queue',
-            'event_receipts', 'next_receipt'})
+            'event_receipts', 'next_receipt', 'event_metadata'})
 
     def test_snapshot_includes_history_when_nonempty(self):
         cache = self.make()
@@ -3458,7 +3458,7 @@ class DiscardHistorySnapshotTest(unittest.TestCase):
         self.assertEqual(cache.snapshot().next_receipt, 1)
         self.assertEqual(set(cache.snapshot()), {
             'values', 'events', 'seen', 'max_queue',
-            'event_receipts', 'next_receipt'})
+            'event_receipts', 'next_receipt', 'event_metadata'})
 
     def test_restore_history_only_field_implies_unlimited_limit(self):
         cache = self.make()
@@ -4469,6 +4469,269 @@ class InspectTest(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 EventCache(self.clock).replay_batch(bad)
+
+
+class QueueMetadataTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def make(self, **kwargs):
+        return EventCache(self.clock, **kwargs)
+
+    # ---- 基本形状与字段 ----
+    def test_peek_with_metadata_reports_push_entries(self):
+        self.cache.push('d1', 'e1', 10)                    # 去重窗口到 110
+        self.cache.push_expiring('d2', 'e2', 20, 50)       # 去重 120，事件 150
+        items = self.cache.peek_with_metadata()
+        self.assertIsInstance(items, list)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0], Result(
+            event='e1', dedupe_key='d1', dedupe_expires_at=110,
+            event_expires_at=None, receipt=1, dedupe_known=True))
+        self.assertEqual(items[1], Result(
+            event='e2', dedupe_key='d2', dedupe_expires_at=120,
+            event_expires_at=150, receipt=2, dedupe_known=True))
+        self.assertIsInstance(items[0], Result)
+
+    def test_metadata_distinguishes_real_none_key_from_unknown(self):
+        self.cache.push(None, 'e1', 10)  # 真实的 None 去重键
+        item = self.cache.peek_with_metadata()[0]
+        self.assertIsNone(item.dedupe_key)
+        self.assertIs(item.dedupe_known, True)
+        self.assertEqual(item.dedupe_expires_at, 110)
+
+    def test_metadata_fields_track_receipt_time_not_later_reads(self):
+        self.cache.push('d', 'e', 10)
+        self.now[0] = 500  # 窗口与事件判定时刻早已过去，元数据仍记接收时刻
+        item = self.cache.peek_with_metadata()[0]
+        self.assertEqual(item.dedupe_expires_at, 110)
+
+    # ---- limit 语义与 peek/pop_batch 一致 ----
+    def test_peek_with_metadata_limit_prefix(self):
+        for i in range(3):
+            self.cache.push('d%d' % i, 'e%d' % i, 10)
+        self.assertEqual([m.event for m in self.cache.peek_with_metadata(2)],
+                         ['e0', 'e1'])
+        self.assertEqual([m.event for m in self.cache.peek_with_metadata(99)],
+                         ['e0', 'e1', 'e2'])
+        self.assertEqual(self.cache.peek_with_metadata(0), [])
+        self.assertEqual(len(self.cache.events), 3)  # 纯查看不移除
+
+    def test_peek_with_metadata_empty_queue(self):
+        self.assertEqual(self.cache.peek_with_metadata(), [])
+        self.assertEqual(self.cache.peek_with_metadata(0), [])
+
+    def test_metadata_limit_validation_no_clock_no_state(self):
+        self.cache.push('d', 'e', 10)
+        for fn in (self.cache.peek_with_metadata, self.cache.pop_with_metadata):
+            for bad in (-1, 2.5, '1', True, object()):
+                calls_before = self.clock_calls[0]
+                with self.assertRaises(ValueError):
+                    fn(bad)
+                self.assertEqual(self.clock_calls[0], calls_before)
+                self.assertEqual(list(self.cache.events), ['e'])
+
+    # ---- 纯查询/纯出队：不读时钟、不清理、不写历史 ----
+    def test_peek_with_metadata_reads_no_clock_and_keeps_expired(self):
+        self.cache.push_expiring('d', 'e', 10, 5)  # 事件到期点 105
+        self.now[0] = 1000
+        calls_before = self.clock_calls[0]
+        items = self.cache.peek_with_metadata()
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(len(items), 1)            # 过期事件原样报告
+        self.assertEqual(items[0].event_expires_at, 105)
+        self.assertEqual(len(self.cache.events), 1)  # 不触发清理
+        self.assertEqual(self.cache.discard_history(), [])
+
+    def test_pop_with_metadata_takes_fifo_prefix_and_frees_capacity(self):
+        cache = self.make(max_queue=2)
+        cache.push('d1', 'e1', 10)
+        cache.push('d2', 'e2', 20)
+        self.assertEqual(cache.push_with_reason('d3', 'e3', 10).reason,
+                         'queue_full')
+        taken = cache.pop_with_metadata(1)
+        self.assertEqual([m.event for m in taken], ['e1'])
+        self.assertEqual(taken[0].dedupe_key, 'd1')
+        self.assertEqual(taken[0].dedupe_expires_at, 110)
+        self.assertEqual(taken[0].receipt, 1)
+        self.assertIs(taken[0].dedupe_known, True)
+        # 释放容量后可继续入队；剩余事件保持 FIFO 顺序
+        self.assertTrue(cache.push('d3', 'e3', 10))
+        self.assertEqual(cache.peek(), ['e2', 'e3'])
+
+    def test_pop_with_metadata_default_takes_all(self):
+        self.cache.push('d1', 'e1', 10)
+        self.cache.push('d2', 'e2', 10)
+        self.assertEqual([m.event for m in self.cache.pop_with_metadata()],
+                         ['e1', 'e2'])
+        self.assertEqual(self.cache.pop_with_metadata(), [])
+        self.assertEqual(len(self.cache.event_metadata), 0)
+
+    def test_pop_with_metadata_keeps_seen_and_writes_no_history(self):
+        self.cache.push('d', 'e', 100)
+        self.cache.pop_with_metadata()
+        # seen 去重窗口保留：窗口内同键仍被去重拦截
+        self.assertEqual(self.cache.seen, {'d': 200})
+        self.assertEqual(self.cache.push_with_reason('d', 'e2', 10).reason,
+                         'dedupe_window')
+        self.assertEqual(self.cache.discard_history(), [])
+
+    def test_pop_with_metadata_reads_no_clock_for_expired_events(self):
+        self.cache.push_expiring('d', 'e', 10, 5)
+        self.now[0] = 1000
+        calls_before = self.clock_calls[0]
+        items = self.cache.pop_with_metadata()
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual([m.event for m in items], ['e'])
+        self.assertEqual(items[0].event_expires_at, 105)
+        self.assertEqual(self.cache.discard_history(), [])
+
+    # ---- 对齐性：各出队/清理路径同步维护元数据 ----
+    def test_metadata_stays_aligned_through_queue_mutations(self):
+        cache = self.make(max_queue=3, overflow_policy='drop_oldest')
+        cache.push_expiring('a', 'e1', 10, 0)   # 接受时已到期
+        cache.push('b', 'e2', 10)
+        cache.push('c', 'e3', 10)
+        cache.push('d', 'e4', 10)               # drop_oldest 挤出 e1
+        cache.cancel(2)                         # 取消 e2
+        cache.push_expiring('e', 'e5', 10, 0)
+        self.now[0] = 200
+        cache.cleanup_expired_events()          # 清掉 e5
+        self.assertEqual([m.event for m in cache.peek_with_metadata()],
+                         cache.peek())
+        self.assertEqual([m.dedupe_key for m in cache.peek_with_metadata()],
+                         ['c', 'd'])
+        cache.resize_queue(1)                   # 挤出 e3
+        self.assertEqual([m.dedupe_key for m in cache.peek_with_metadata()],
+                         ['d'])
+        cache.pop()
+        self.assertEqual(cache.peek_with_metadata(), [])
+        self.assertEqual(len(cache.event_metadata), 0)
+
+    # ---- 快照：始终携带对齐的 event_metadata ----
+    def test_snapshot_includes_aligned_event_metadata(self):
+        self.cache.push('d1', 'e1', 10)
+        self.cache.push_expiring('d2', 'e2', 20, 50)
+        snap = self.cache.snapshot()
+        self.assertIn('event_metadata', snap)
+        self.assertIsInstance(snap.event_metadata, list)
+        self.assertEqual(len(snap.event_metadata), len(snap.events))
+        self.assertEqual(snap.event_metadata[0], Result(
+            dedupe_known=True, dedupe_key='d1', dedupe_expires_at=110))
+        self.assertEqual(snap.event_metadata[1], Result(
+            dedupe_known=True, dedupe_key='d2', dedupe_expires_at=120))
+
+    def test_snapshot_metadata_detached_from_cache(self):
+        self.cache.push('d', 'e', 10)
+        snap = self.cache.snapshot()
+        snap['event_metadata'][0]['dedupe_key'] = 'hacked'
+        snap['event_metadata'].append(Result(
+            dedupe_known=True, dedupe_key='x', dedupe_expires_at=1))
+        self.assertEqual(self.cache.peek_with_metadata()[0].dedupe_key, 'd')
+        self.assertEqual(len(self.cache.event_metadata), 1)
+
+    def test_snapshot_restore_round_trip_preserves_metadata(self):
+        self.cache.push('d1', 'e1', 10)
+        self.cache.push_expiring(None, 'e2', 20, 50)
+        snap1 = self.cache.snapshot()
+        rebuilt = self.make()
+        self.assertIsNone(rebuilt.restore(snap1))
+        self.assertEqual(rebuilt.snapshot(), snap1)
+        self.assertEqual(rebuilt.peek_with_metadata(),
+                         self.cache.peek_with_metadata())
+
+    def test_restore_old_snapshot_marks_metadata_unknown(self):
+        self.cache.restore({'values': {}, 'events': ['a', 'b'],
+                            'seen': {}, 'max_queue': None})
+        items = self.cache.peek_with_metadata()
+        self.assertEqual([m.event for m in items], ['a', 'b'])
+        for item in items:
+            self.assertIs(item.dedupe_known, False)
+            self.assertIsNone(item.dedupe_key)
+            self.assertIsNone(item.dedupe_expires_at)
+            self.assertIsNone(item.event_expires_at)
+            self.assertIsNone(item.receipt)
+        # 恢复后再快照仍往返一致
+        snap = self.cache.snapshot()
+        rebuilt = self.make()
+        rebuilt.restore(snap)
+        self.assertEqual(rebuilt.snapshot(), snap)
+
+    def test_restore_metadata_unknown_entries_normalize_fields_to_none(self):
+        self.cache.restore({
+            'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None,
+            'event_metadata': [{'dedupe_known': False,
+                                'dedupe_key': 'ignored',
+                                'dedupe_expires_at': 5}]})
+        item = self.cache.peek_with_metadata()[0]
+        self.assertIs(item.dedupe_known, False)
+        self.assertIsNone(item.dedupe_key)
+        self.assertIsNone(item.dedupe_expires_at)
+
+    # ---- 恢复校验：非法元数据统一 ValueError 且保持原状态 ----
+    def assert_restore_rejected(self, bad):
+        self.cache.push('d', 'e', 100)
+        before = self.cache.snapshot()
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.restore(bad)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.snapshot(), before)
+
+    def test_restore_rejects_bad_metadata_container_and_length(self):
+        base = {'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None}
+        good = [{'dedupe_known': True, 'dedupe_key': 'k',
+                 'dedupe_expires_at': 10}]
+        self.assert_restore_rejected(dict(base, event_metadata='x'))
+        self.assert_restore_rejected(dict(base, event_metadata=None))
+        self.assert_restore_rejected(dict(base, event_metadata=[]))
+        self.assert_restore_rejected(dict(base, event_metadata=good * 2))
+
+    def test_restore_rejects_bad_metadata_entry_shape(self):
+        base = {'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None}
+        self.assert_restore_rejected(dict(base, event_metadata=['x']))
+        self.assert_restore_rejected(dict(base, event_metadata=[{}]))
+        self.assert_restore_rejected(dict(base, event_metadata=[
+            {'dedupe_known': True, 'dedupe_key': 'k'}]))
+        self.assert_restore_rejected(dict(base, event_metadata=[
+            {'dedupe_known': True, 'dedupe_key': 'k',
+             'dedupe_expires_at': 1, 'extra': 2}]))
+
+    def test_restore_rejects_non_bool_known_flag(self):
+        base = {'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None}
+        for bad_known in (0, 1, 'true', None):
+            self.assert_restore_rejected(dict(base, event_metadata=[
+                {'dedupe_known': bad_known, 'dedupe_key': 'k',
+                 'dedupe_expires_at': 1}]))
+
+    def test_restore_rejects_bad_metadata_key_and_time(self):
+        base = {'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None}
+        for bad_key in ([], {}, set()):
+            self.assert_restore_rejected(dict(base, event_metadata=[
+                {'dedupe_known': True, 'dedupe_key': bad_key,
+                 'dedupe_expires_at': 1}]))
+        for bad_time in (float('nan'), float('inf'), 'x', True, []):
+            self.assert_restore_rejected(dict(base, event_metadata=[
+                {'dedupe_known': True, 'dedupe_key': 'k',
+                 'dedupe_expires_at': bad_time}]))
+
+    def test_restore_accepts_none_key_and_none_expiry_when_known(self):
+        # None 是真实的去重键；到期点为 None 同样合法
+        self.cache.restore({
+            'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None,
+            'event_metadata': [{'dedupe_known': True, 'dedupe_key': None,
+                                'dedupe_expires_at': None}]})
+        item = self.cache.peek_with_metadata()[0]
+        self.assertIs(item.dedupe_known, True)
+        self.assertIsNone(item.dedupe_key)
 
 
 if __name__ == '__main__':

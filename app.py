@@ -5,10 +5,12 @@ from collections.abc import Mapping
 _SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
 # 可选字段：event_expiries（事件 TTL 对齐信息）、overflow_policy（溢出策略）、
 # discard_history（丢弃审计历史）与 discard_history_limit（历史容量）、
-# event_receipts（与事件对齐的回执）与 next_receipt（下一个待分配回执）
+# event_receipts（与事件对齐的回执）与 next_receipt（下一个待分配回执）、
+# event_metadata（与事件对齐的去重元数据）
 _SNAPSHOT_FIELDS_ALL = _SNAPSHOT_FIELDS | frozenset((
     'event_expiries', 'overflow_policy', 'discard_history', 'discard_history_limit',
-    'event_receipts', 'next_receipt', 'clock_policy', 'last_clock_time'))
+    'event_receipts', 'next_receipt', 'clock_policy', 'last_clock_time',
+    'event_metadata'))
 
 _OVERFLOW_POLICIES = frozenset(('reject_new', 'drop_oldest'))
 
@@ -35,6 +37,12 @@ class ClockRegressionError(RuntimeError):
 # 丢弃审计历史只记录两种原因：事件 TTL 到期清理与 drop_oldest 队首挤出
 _DISCARD_REASONS = frozenset(('event_ttl', 'queue_full'))
 _DISCARD_ENTRY_FIELDS = frozenset(('event', 'reason', 'timestamp'))
+
+# 队列条目去重元数据的三个字段：dedupe_known 标记去重键是否已知（区分真实
+# 的 None 键与未知键），dedupe_key 为入队时的去重键，dedupe_expires_at 为
+# 接收时刻加去重窗口的绝对到期点；未知键条目后两个字段恒为 None
+_METADATA_ENTRY_FIELDS = frozenset(
+    ('dedupe_known', 'dedupe_key', 'dedupe_expires_at'))
 
 # resize_queue 的 overflow_policy 缺省哨兵：省略时沿用当前策略；
 # 显式传入（含 None）必须能通过 _check_overflow_policy 校验
@@ -438,11 +446,20 @@ def _parse_snapshot(snapshot):
     有限 int/float（允许负数），event 可为任意对象（含 None）；
     discard_history_limit 为 None 或非负整数。两个历史字段均可省略：
     缺 discard_history 按空历史解释，缺 discard_history_limit 按无限容量
-    解释，只给出其一时另一项按缺省解释。三类到期时间（values 的
+    解释，只给出其一时另一项按缺省解释。event_metadata 为与 events 等长的
+    对齐列表，每项必须是恰好含 dedupe_known、dedupe_key、dedupe_expires_at
+    三个字段的映射：dedupe_known 只能是 bool（True 表示去重键已知，False
+    表示未知键旧条目，借此区分真实的 None 键与未知键）；dedupe_key 为入队
+    时的去重键，必须可哈希（含 None，None 是真实去重键而非未知标记）；
+    dedupe_expires_at 为 None 或非 bool 的有限 int/float 绝对到期点（允许
+    负数与已过期时刻）。dedupe_known 为 False 的条目一律按未知键旧条目
+    恢复（dedupe_key/dedupe_expires_at 规范为 None）。缺 event_metadata
+    字段的旧快照按全部条目 dedupe_known=False 解释，保持兼容。三类到期时间（values 的
     expires_at、seen 的到期时刻、event_expiries 的非 None 项）都只能是非
     bool 的有限 int/float，允许负数与已过期时刻，不解释为相对时长。字段
     缺失或多余、非映射/列表容器、二元组结构不符、event_expiries/
-    event_receipts 长度不一致、event_receipts/next_receipt 回执非法或
+    event_receipts/event_metadata 长度不一致、event_metadata 条目结构/
+    known 标记/到期时间非法或键不可哈希、event_receipts/next_receipt 回执非法或
     next_receipt 不大于在队回执、overflow_policy 非法、历史条目结构/原因/
     时间戳非法、discard_history_limit 非法或任一到期值为
     NaN/无穷/字符串/复合对象、max_queue 非法或 max_queue 为非负整数而事件
@@ -539,6 +556,49 @@ def _parse_snapshot(snapshot):
         # 旧格式快照：旧事件无回执（不可被 cancel 命中），新回执从 1 分配
         event_receipts = deque([None] * len(raw_events))
         next_receipt = 1
+    if 'event_metadata' in snapshot:
+        raw_metadata = snapshot['event_metadata']
+        if not isinstance(raw_metadata, list):
+            raise ValueError('snapshot event_metadata must be a list')
+        if len(raw_metadata) != len(raw_events):
+            raise ValueError('snapshot event_metadata must align with events in length')
+        event_metadata = deque()
+        for entry in raw_metadata:
+            if not isinstance(entry, Mapping) or \
+                    frozenset(entry.keys()) != _METADATA_ENTRY_FIELDS:
+                raise ValueError(
+                    'each event_metadata entry must be a mapping with '
+                    'dedupe_known, dedupe_key, dedupe_expires_at')
+            known = entry['dedupe_known']
+            # known 标记只接受真正的 bool，不用真值表推断
+            if not isinstance(known, bool):
+                raise ValueError('event_metadata dedupe_known must be a bool')
+            key = entry['dedupe_key']
+            expiry = entry['dedupe_expires_at']
+            if key is not None:
+                # 去重键必须可哈希；元数据校验统一报 ValueError（含不可哈希键）
+                try:
+                    hash(key)
+                except TypeError:
+                    raise ValueError(
+                        'event_metadata dedupe_key must be hashable')
+            if expiry is not None:
+                _check_expiry(expiry, 'event_metadata dedupe_expires_at')
+            if known:
+                # 已知键条目：None 键是真实的 None 去重键，原样保留
+                event_metadata.append(Result(
+                    dedupe_known=True, dedupe_key=key,
+                    dedupe_expires_at=expiry))
+            else:
+                # 未知键旧条目：相关字段一律规范为 None
+                event_metadata.append(Result(
+                    dedupe_known=False, dedupe_key=None,
+                    dedupe_expires_at=None))
+    else:
+        # 旧格式快照：所有事件的去重键未知，相关字段为 None
+        event_metadata = deque(
+            Result(dedupe_known=False, dedupe_key=None, dedupe_expires_at=None)
+            for _ in range(len(raw_events)))
     # 缺省按 'reject_new' 解释；显式给出时校验合法性
     overflow_policy = snapshot.get('overflow_policy', 'reject_new')
     _check_overflow_policy(overflow_policy)
@@ -595,7 +655,8 @@ def _parse_snapshot(snapshot):
         last_clock_time = None
     return (values, events, event_expiries, seen, max_queue,
             overflow_policy, discard_history, discard_history_limit,
-            event_receipts, next_receipt, clock_policy, last_clock_time)
+            event_receipts, next_receipt, clock_policy, last_clock_time,
+            event_metadata)
 
 
 class EventCache:
@@ -620,6 +681,10 @@ class EventCache:
         # 与 events 逐元素对齐：None 表示旧事件（无回执，cancel 不命中），
         # 否则为该事件分配的、从 1 起递增且不复用的正整数回执
         self.event_receipts = deque()
+        # 与 events 逐元素对齐：每项为含 dedupe_known/dedupe_key/
+        # dedupe_expires_at 的 Result；经 push 入口接受的事件记为已知键
+        # （dedupe_known=True，含真实的 None 键），旧快照恢复的事件为未知键
+        self.event_metadata = deque()
         # 下一个待分配的回执；仅在入队被接受时自增，拒绝、出队与取消都不复用
         self._next_receipt = 1
         self.seen = {}
@@ -887,13 +952,16 @@ class EventCache:
         # 到期点 <= 当前时刻即移除。未到期事件与未设置事件 TTL 的旧事件一律
         # 保留且相对顺序不变；values、seen 与 max_queue 不受影响。每个被移除
         # 事件按触发清理的观察时刻 now 追加一条 reason='event_ttl' 的审计历史。
-        # 被移除事件的回执一并出列：回执不复用，此后对其 cancel 报 missing。
+        # 被移除事件的回执与去重元数据一并出列：回执不复用，此后对其
+        # cancel 报 missing。
         kept_events = deque()
         kept_expiries = deque()
         kept_receipts = deque()
+        kept_metadata = deque()
         events_removed = 0
-        for event, expiry, receipt in zip(self.events, self.event_expiries,
-                                          self.event_receipts):
+        for event, expiry, receipt, metadata in zip(
+                self.events, self.event_expiries, self.event_receipts,
+                self.event_metadata):
             if expiry is not None and expiry <= now:
                 events_removed += 1
                 self._record_discard(event, 'event_ttl', now)
@@ -901,9 +969,11 @@ class EventCache:
                 kept_events.append(event)
                 kept_expiries.append(expiry)
                 kept_receipts.append(receipt)
+                kept_metadata.append(metadata)
         self.events = kept_events
         self.event_expiries = kept_expiries
         self.event_receipts = kept_receipts
+        self.event_metadata = kept_metadata
         return events_removed
 
     def cleanup_expired_events(self):
@@ -927,13 +997,15 @@ class EventCache:
         kept_events = deque()
         kept_expiries = deque()
         kept_receipts = deque()
+        kept_metadata = deque()
         discarded = []
-        for event, expiry, receipt in zip(self.events, self.event_expiries,
-                                          self.event_receipts):
+        for event, expiry, receipt, metadata in zip(
+                self.events, self.event_expiries, self.event_receipts,
+                self.event_metadata):
             if expiry is not None and expiry <= now:
                 # 事件值为 None 也保留该条丢弃记录；同时写入审计历史。
                 # discarded 形状保持不变（只有 event/reason），不带回执；
-                # 回执随事件一并出列且不复用。
+                # 回执与去重元数据随事件一并出列且不复用。
                 record = Result(event=event, reason='event_ttl')
                 discarded.append(record)
                 self._record_discard(event, 'event_ttl', now)
@@ -941,9 +1013,11 @@ class EventCache:
                 kept_events.append(event)
                 kept_expiries.append(expiry)
                 kept_receipts.append(receipt)
+                kept_metadata.append(metadata)
         self.events = kept_events
         self.event_expiries = kept_expiries
         self.event_receipts = kept_receipts
+        self.event_metadata = kept_metadata
         return discarded
 
     def discard_expired_events(self):
@@ -1012,11 +1086,12 @@ class EventCache:
         evicted = []
         if self.max_queue is not None and len(self.events) >= self.max_queue:
             if self.overflow_policy == 'drop_oldest' and self.max_queue > 0:
-                # 挤出 FIFO 队首并同步移除其 event_ttl / 回执元数据；被挤出
-                # 事件的去重记录保留到原窗口截止，不在此删除
+                # 挤出 FIFO 队首并同步移除其 event_ttl / 回执 / 去重元数据；
+                # 被挤出事件的去重记录保留到原窗口截止，不在此删除
                 evicted_event = self.events.popleft()
                 self.event_expiries.popleft()
                 evicted_receipt = self.event_receipts.popleft()
+                self.event_metadata.popleft()
                 # 审计历史固定 reason='queue_full'、形状不含回执，时间戳取
                 # 触发本次入队判定的观察时刻 now
                 evicted.append((evicted_event, evicted_receipt))
@@ -1034,6 +1109,11 @@ class EventCache:
         receipt = self._next_receipt
         self._next_receipt += 1
         self.event_receipts.append(receipt)
+        # 去重元数据与 seen 记录同一到期点：接收时刻 + window；dedupe 为
+        # None 时记的是真实的 None 键（dedupe_known 仍为 True）
+        self.event_metadata.append(Result(
+            dedupe_known=True, dedupe_key=dedupe,
+            dedupe_expires_at=now + window))
         return None, evicted, receipt
 
     def _push_result(self, reason, evicted):
@@ -1428,6 +1508,7 @@ class EventCache:
             return None
         self.event_expiries.popleft()
         self.event_receipts.popleft()
+        self.event_metadata.popleft()
         return self.events.popleft()
 
     def pop_with_receipt(self):
@@ -1444,6 +1525,7 @@ class EventCache:
             return Result(found=False, event=None, receipt=None)
         self.event_expiries.popleft()
         receipt = self.event_receipts.popleft()
+        self.event_metadata.popleft()
         event = self.events.popleft()
         return Result(found=True, event=event, receipt=receipt)
 
@@ -1465,6 +1547,7 @@ class EventCache:
             self.event_expiries.popleft()
             # 回执随事件一并出列且不复用；pop_batch 的返回形状保持只有事件
             self.event_receipts.popleft()
+            self.event_metadata.popleft()
         return taken
 
     def peek(self, limit=None):
@@ -1495,6 +1578,73 @@ class EventCache:
         return [Result(event=event, receipt=receipt)
                 for event, receipt in zip(self.events, self.event_receipts)]
 
+    @staticmethod
+    def _metadata_result(event, expiry, receipt, metadata):
+        # peek_with_metadata/pop_with_metadata 的单项结果形状：事件本体、
+        # 去重键与其窗口到期点、事件 TTL 到期点、回执与 known 标记。
+        # 未知键旧条目的 dedupe_key/dedupe_expires_at 已为 None。
+        return Result(
+            event=event,
+            dedupe_key=metadata.dedupe_key,
+            dedupe_expires_at=metadata.dedupe_expires_at,
+            event_expires_at=expiry,
+            receipt=receipt,
+            dedupe_known=metadata.dedupe_known,
+        )
+
+    def peek_with_metadata(self, limit=None):
+        """非破坏性地查看队头事件及其去重元数据：按插入顺序返回前缀。
+
+        limit 为 None（缺省）时返回当前队列的全部条目；为非负整数时最多返回
+        该数量的队头前缀，数量不足只返回实际存在的条目。按当前 FIFO 顺序返回
+        普通 list，每项为 Result(event=事件, dedupe_key=去重键,
+        dedupe_expires_at=去重窗口绝对到期点, event_expires_at=事件 TTL 绝对
+        到期点或 None, receipt=回执或 None, dedupe_known=去重键是否已知)。
+        经 push 入口接受的事件 dedupe_known 为 True（dedupe 为 None 时记的是
+        真实的 None 键），dedupe_expires_at 为接收时刻加 window；旧快照恢复
+        的未知键条目 dedupe_known 为 False，dedupe_key 与 dedupe_expires_at
+        均为 None。
+
+        纯查看操作：不读取时钟、不因条目过期而清理或写入丢弃历史、不移除任何
+        项目、不释放槽位、不触碰 values/seen，过期事件也原样报告。空队列与
+        limit 为零返回空列表。limit 为负数、浮点数、字符串、布尔值或其他非
+        整数时抛出 ValueError，抛出前不读取时钟、不改变任何状态。
+        """
+        _check_limit(limit)
+        count = len(self.events) if limit is None else min(limit, len(self.events))
+        # 只物化队头前缀副本，各对齐 deque 本身保持不变
+        return [self._metadata_result(
+                    self.events[i], self.event_expiries[i],
+                    self.event_receipts[i], self.event_metadata[i])
+                for i in range(count)]
+
+    def pop_with_metadata(self, limit=None):
+        """按 FIFO 从队头批量取出事件及其去重元数据。
+
+        limit 为 None（缺省）时取出当前队列全部条目；为非负整数时最多取出
+        该数量，数量不足只返回实际存在的条目。返回普通 list，每项形状与
+        peek_with_metadata 相同：Result(event, dedupe_key, dedupe_expires_at,
+        event_expires_at, receipt, dedupe_known)，顺序与当前队列一致。
+
+        纯出队操作：不读取时钟、不触发过期清理、不写入丢弃历史，只移除返回的
+        队列项并为每项释放一个队列容量位置；不触碰 values，也不删除 seen 中
+        对应的去重窗口（窗口保留到原截止时刻，窗口内同去重键仍被去重拦截）。
+        被取出事件的回执随事件出列且不复用。limit 为负数、浮点数、字符串、
+        布尔值或其他非整数时抛出 ValueError，抛出前不读取时钟、不改变任何
+        状态。
+        """
+        _check_limit(limit)
+        count = len(self.events) if limit is None else min(limit, len(self.events))
+        # 逐个 popleft 与连续调用 pop 的顺序和元素完全一致
+        taken = []
+        for _ in range(count):
+            event = self.events.popleft()
+            expiry = self.event_expiries.popleft()
+            receipt = self.event_receipts.popleft()
+            metadata = self.event_metadata.popleft()
+            taken.append(self._metadata_result(event, expiry, receipt, metadata))
+        return taken
+
     def _pop_live_batch_at(self, limit, now):
         # 在指定时刻执行过期感知出队；limit 由调用方先行校验。空队列或
         # limit == 0 时与公开入口一致：不扫描、不改状态，返回两个空列表。
@@ -1507,8 +1657,10 @@ class EventCache:
         while self.events:
             event = self.events.popleft()
             expiry = self.event_expiries.popleft()
-            # 回执随被扫描项目（无论交付还是丢弃）一并出列且不复用
+            # 回执与去重元数据随被扫描项目（无论交付还是丢弃）一并出列，
+            # 回执不复用
             self.event_receipts.popleft()
+            self.event_metadata.popleft()
             if expiry is not None and expiry <= now:
                 # 到期边界与 values/seen/cleanup_expired_events 一致：<= 即过期
                 discarded.append(Result(event=event, reason='event_ttl'))
@@ -1627,12 +1779,14 @@ class EventCache:
         if index is None:
             # 未知、已出队、已驱逐或已取消：回执永不复用
             return Result(removed=False, event=None, reason='missing')
-        # 命中：在同一索引处移除对齐的事件、到期信息与回执。回执单调且不复用，
-        # 因此至多命中一个位置；del deque[i] 保持其余元素的相对顺序。
+        # 命中：在同一索引处移除对齐的事件、到期信息、回执与去重元数据。
+        # 回执单调且不复用，因此至多命中一个位置；del deque[i] 保持其余元素
+        # 的相对顺序。
         event = self.events[index]
         del self.events[index]
         del self.event_expiries[index]
         del self.event_receipts[index]
+        del self.event_metadata[index]
         # 仅释放容量：seen 去重窗口保留，不写丢弃历史，不推进回执计数
         return Result(removed=True, event=event, reason=None)
 
@@ -1656,6 +1810,7 @@ class EventCache:
                 # 回执随被挤出事件一并出列且不复用；resize 的 discarded 形状
                 # 保持不变（只有 event/reason），不携带回执
                 self.event_receipts.popleft()
+                self.event_metadata.popleft()
                 # 事件值为 None 也保留该条丢弃记录；审计历史固定
                 # reason='queue_full'，时间戳取本次调整的观察时刻 now
                 discarded.append(Result(event=evicted, reason='queue_full'))
@@ -1755,7 +1910,11 @@ class EventCache:
         max_queue 以及回执的两个字段：与 events 逐项对齐的 event_receipts
         （每项为该事件的正整数回执；旧快照恢复出的无回执事件为 None）与
         next_receipt（下一个待分配回执，严格大于任一对齐回执；即使队列已空，
-        已分配过的号也借由该字段保留，绝不复用）。队列中存在带 TTL 事件时
+        已分配过的号也借由该字段保留，绝不复用）；并始终含与 events 逐项对齐
+        的 event_metadata：每项为含 dedupe_known、dedupe_key、
+        dedupe_expires_at 的 Result，dedupe_known 为 True 表示去重键已知
+        （dedupe_key 为 None 时是真实的 None 键），为 False 表示旧快照恢复
+        的未知键条目（后两个字段为 None）。队列中存在带 TTL 事件时
         增加 event_expiries 字段，无 TTL 的事件以 None 表示；overflow_policy
         非默认（'drop_oldest'）时增加同名字段。
         丢弃审计历史非空或历史容量非默认（非 None）时增加 discard_history
@@ -1779,6 +1938,14 @@ class EventCache:
             # next_receipt 即便队列为空也保留已分配号段，保证恢复后不复用
             event_receipts=list(self.event_receipts),
             next_receipt=self._next_receipt,
+            # 去重元数据同样始终随快照保存并逐项物化为全新 Result，
+            # 与内部 deque 相互独立（去重键对象按既有接口语义保留引用）
+            event_metadata=[
+                Result(dedupe_known=entry.dedupe_known,
+                       dedupe_key=entry.dedupe_key,
+                       dedupe_expires_at=entry.dedupe_expires_at)
+                for entry in self.event_metadata
+            ],
         )
         if any(expiry is not None for expiry in self.event_expiries):
             snap['event_expiries'] = list(self.event_expiries)
@@ -1811,6 +1978,14 @@ class EventCache:
         cancel 不命中），下一个回执从 1 开始分配；给出时 event_receipts 必须与
         events 等长对齐、每项为 None 或排除 bool 的正整数，next_receipt 必须
         是严格大于任一对齐回执的正整数，恢复后在其基础上继续递增、绝不复用。
+        event_metadata 字段同样可整体省略：缺省时在队事件全部视为未知键旧
+        条目（dedupe_known=False，dedupe_key 与 dedupe_expires_at 为 None，
+        peek_with_metadata/pop_with_metadata 因此对这些条目返回 None 字段）；
+        给出时必须是与 events 等长对齐的列表，每项为恰好含 dedupe_known/
+        dedupe_key/dedupe_expires_at 的映射，known 标记只能是 bool，去重键
+        必须可哈希（None 表示真实的 None 键），到期点为 None 或非 bool 的
+        有限 int/float；长度不符、known 标记非 bool、到期时间或键类型非法
+        时统一抛出 ValueError 且保持原状态。
         历史条目必须是恰好含 event/reason/timestamp 的映射，reason 只能是
         'event_ttl' 或 'queue_full'，timestamp 为非 bool 的有限 int/float，
         历史容量为 None 或非负整数，任一非法都抛出 ValueError 且保持原状态。
@@ -1832,11 +2007,12 @@ class EventCache:
         (values, events, event_expiries, seen, max_queue, overflow_policy,
          discard_history, discard_history_limit,
          event_receipts, next_receipt,
-         clock_policy, last_clock_time) = _parse_snapshot(snapshot)
+         clock_policy, last_clock_time, event_metadata) = _parse_snapshot(snapshot)
         self.values = values
         self.events = events
         self.event_expiries = event_expiries
         self.event_receipts = event_receipts
+        self.event_metadata = event_metadata
         self._next_receipt = next_receipt
         self.seen = seen
         self.max_queue = max_queue
