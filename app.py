@@ -8,9 +8,29 @@ _SNAPSHOT_FIELDS = frozenset(('values', 'events', 'seen', 'max_queue'))
 # event_receipts（与事件对齐的回执）与 next_receipt（下一个待分配回执）
 _SNAPSHOT_FIELDS_ALL = _SNAPSHOT_FIELDS | frozenset((
     'event_expiries', 'overflow_policy', 'discard_history', 'discard_history_limit',
-    'event_receipts', 'next_receipt'))
+    'event_receipts', 'next_receipt', 'clock_policy', 'last_clock_time'))
 
 _OVERFLOW_POLICIES = frozenset(('reject_new', 'drop_oldest'))
+
+# 实时单调时钟保护策略：allow_regression 沿用允许时钟回退的既有行为；
+# reject_regression 在每次实际采样时拒绝小于最近成功采样水位的读数
+_CLOCK_POLICIES = frozenset(('allow_regression', 'reject_regression'))
+
+
+class ClockRegressionError(RuntimeError):
+    """reject_regression 策略下注入时钟读数小于最近成功采样水位时抛出。
+
+    抛出时调用尚未改变任何状态：值、事件、去重表、回执、丢弃历史与时间
+    水位全部保持调用前原样。current 为本次被拒绝的读数，last_time 为最近
+    一次成功采样的水位（首次采样前不会抛出本异常）。
+    """
+
+    def __init__(self, current, last_time):
+        super().__init__(
+            'clock regressed: observed %r, last successful sample was %r'
+            % (current, last_time))
+        self.current = current
+        self.last_time = last_time
 
 # 丢弃审计历史只记录两种原因：事件 TTL 到期清理与 drop_oldest 队首挤出
 _DISCARD_REASONS = frozenset(('event_ttl', 'queue_full'))
@@ -93,6 +113,13 @@ def _check_overflow_policy(value):
     """overflow_policy 只能是 'reject_new' 或 'drop_oldest' 字符串。"""
     if not isinstance(value, str) or value not in _OVERFLOW_POLICIES:
         raise ValueError("overflow_policy must be 'reject_new' or 'drop_oldest'")
+
+
+def _check_clock_policy(value):
+    """clock_policy 只能是 'allow_regression' 或 'reject_regression' 字符串。"""
+    if not isinstance(value, str) or value not in _CLOCK_POLICIES:
+        raise ValueError(
+            "clock_policy must be 'allow_regression' or 'reject_regression'")
 
 
 def _check_limit(value):
@@ -377,8 +404,9 @@ def _parse_snapshot(snapshot):
 
     快照必须是含 values、events、seen、max_queue 四个字段的映射，可在此
     基础上增加与 events 对齐的 event_expiries 字段、overflow_policy 字段、
-    丢弃审计历史的 discard_history / discard_history_limit 字段以及回执的
-    event_receipts / next_receipt 字段：
+    丢弃审计历史的 discard_history / discard_history_limit 字段、回执的
+    event_receipts / next_receipt 字段以及实时时钟保护的
+    clock_policy / last_clock_time 字段：
     values 为 key -> (value, expires_at) 的映射，seen 为去重键 ->
     绝对到期时间的映射，events 为事件列表（按 FIFO 顺序），max_queue 为
     None 或非负整数，event_expiries 为与 events 等长的列表，每项为
@@ -403,7 +431,14 @@ def _parse_snapshot(snapshot):
     时间戳非法、discard_history_limit 非法或任一到期值为
     NaN/无穷/字符串/复合对象、max_queue 非法或 max_queue 为非负整数而事件
     条目数超过该上限（零上限只接受空队列，判断针对实际条目数而非过期与否，
-    超容快照整体拒绝而不截断或挤出）时统一抛出 ValueError；键不可哈希时
+    超容快照整体拒绝而不截断或挤出）时统一抛出 ValueError；clock_policy
+    缺省时按 'allow_regression' 解释（旧快照因此保持兼容），显式给出时只能
+    是 'allow_regression' 或 'reject_regression'；last_clock_time 与
+    clock_policy 成对出现，只能是 None 或非 bool 的有限 int/float（允许负数，
+    与绝对到期时刻同类），只给出其一时另一项不做缺省推断而整体拒绝；
+    allow_regression 快照的水位恒按 None 恢复（即使给出 last_clock_time 也
+    不接受带水位的 allow_regression 快照，避免旧的过期记录在策略语义下被
+    重新判为有效）；键不可哈希时
     原样抛出 TypeError。校验期间一次性物化为全新的 dict/list/deque，供调用
     方随后整体替换状态。
     """
@@ -520,21 +555,48 @@ def _parse_snapshot(snapshot):
             discard_history = deque()
         else:
             discard_history = deque(list(discard_history)[-discard_history_limit:])
+    # 实时时钟保护策略：缺省按 allow_regression 解释，旧快照保持兼容；
+    # 显式给出时校验合法性。clock_policy 与 last_clock_time 成对出现，
+    # 缺前者时后者也不被接受（默认形状的快照不含水位字段），缺后者时
+    # reject_regression 无法表达明确水位，同样整体拒绝。
+    clock_policy = snapshot.get('clock_policy', 'allow_regression')
+    _check_clock_policy(clock_policy)
+    if 'clock_policy' in snapshot:
+        if 'last_clock_time' not in snapshot:
+            raise ValueError('snapshot last_clock_time required with clock_policy')
+        last_clock_time = snapshot['last_clock_time']
+        if last_clock_time is not None:
+            # 非 None 水位与绝对到期时刻同类：非 bool 的有限 int/float，允许负数
+            _check_expiry(last_clock_time, 'last_clock_time')
+        if clock_policy == 'allow_regression' and last_clock_time is not None:
+            # 允许回退模式不维护水位：带水位的该类快照语义不一致，整体拒绝
+            raise ValueError(
+                'snapshot last_clock_time must be None for allow_regression')
+    elif 'last_clock_time' in snapshot:
+        raise ValueError('snapshot clock_policy required with last_clock_time')
+    else:
+        # 旧格式快照：沿用允许回退行为且无时间水位
+        last_clock_time = None
     return (values, events, event_expiries, seen, max_queue,
             overflow_policy, discard_history, discard_history_limit,
-            event_receipts, next_receipt)
+            event_receipts, next_receipt, clock_policy, last_clock_time)
 
 
 class EventCache:
     def __init__(self, clock, max_queue=None, overflow_policy='reject_new',
-                 discard_history_limit=None):
+                 discard_history_limit=None, clock_policy='allow_regression'):
         # 策略与容量在校验通过前不触碰任何状态，也不读取时钟
         _check_max_queue(max_queue)
         _check_overflow_policy(overflow_policy)
         _check_discard_history_limit(discard_history_limit)
+        _check_clock_policy(clock_policy)
         self.clock = clock
         self.max_queue = max_queue
         self.overflow_policy = overflow_policy
+        self.clock_policy = clock_policy
+        # reject_regression 下最近一次成功采样的实时时钟水位；首次采样前为
+        # None。allow_regression 始终为 None：不比较、不推进。
+        self._last_clock_time = None
         self.values = {}
         self.events = deque()
         # 与 events 逐元素对齐：None 表示无事件 TTL，否则为绝对到期时刻
@@ -561,13 +623,42 @@ class EventCache:
         if limit is not None and len(history) > limit:
             history.popleft()
 
+    def _read_clock(self):
+        """实时路径唯一的注入时钟采样点，并在 reject_regression 下守护水位。
+
+        allow_regression 时直接返回时钟读数，不比较也不维护水位，沿用既有
+        的允许回退行为。reject_regression 时：首次采样（水位为 None）只记录
+        读数；此后读数等于水位可继续，小于水位抛出 ClockRegressionError，
+        且在抛出前不触碰任何状态（水位与数据均保持原样）；时钟自身抛出的
+        异常原样传播，同样不改变水位与数据。采样成功即推进水位，即使调用
+        方随后得到的是 missing、expired、queue_full 或没有可清理项。
+        """
+        now = self.clock()
+        if self.clock_policy == 'reject_regression':
+            last = self._last_clock_time
+            if last is not None and now < last:
+                raise ClockRegressionError(now, last)
+            self._last_clock_time = now
+        return now
+
+    def clock_status(self):
+        """不读取时钟地报告实时时钟保护状态。
+
+        纯查询：永不读取注入时钟、永不推进水位、不改变任何状态。返回
+        Result(clock_policy=当前策略, last_time=最近一次成功采样的水位)，
+        首次采样前 last_time 为 None；allow_regression 下 last_time 恒为
+        None。
+        """
+        return Result(clock_policy=self.clock_policy,
+                      last_time=self._last_clock_time)
+
     def _put_at(self, key, value, ttl, now):
         # 以写入时刻加 ttl 记录到期点，并替换同 key 旧值；ttl 由调用方先行校验
         self.values[key] = (value, now + ttl)
 
     def put(self, key, value, ttl):
         _check_duration(ttl, 'ttl')
-        now = self.clock()
+        now = self._read_clock()
         self._put_at(key, value, ttl, now)
 
     def _get_at(self, key, now):
@@ -586,7 +677,7 @@ class EventCache:
         item = self.values.get(key)
         if item is None:
             return None
-        return self._get_at(key, self.clock())
+        return self._get_at(key, self._read_clock())
 
     def _get_with_reason_at(self, key, now):
         # 与 _get_at 共用同一 <= 过期边界与到期即删清理，但结果区分三种情形；
@@ -617,7 +708,7 @@ class EventCache:
         # 与 get 相同的时钟约定：键不存在（或值记录缺失）时不读取注入时钟
         if key not in self.values:
             return Result(found=False, value=None, reason='missing')
-        return self._get_with_reason_at(key, self.clock())
+        return self._get_with_reason_at(key, self._read_clock())
 
     def delete(self, key):
         # 结果只表达键是否存在，与取出的值无关：value 为 None、False、0、''
@@ -644,7 +735,7 @@ class EventCache:
         return values_removed, dedupe_removed
 
     def cleanup(self):
-        now = self.clock()
+        now = self._read_clock()
         values_removed, dedupe_removed = self._cleanup_at(now)
         return Result(values_removed=values_removed, dedupe_removed=dedupe_removed)
 
@@ -681,7 +772,7 @@ class EventCache:
         移除事件以本次时钟读数为 timestamp 追加一条 reason='event_ttl' 的
         丢弃审计历史（受 discard_history_limit 容量约束）。
         """
-        now = self.clock()
+        now = self._read_clock()
         return Result(events_removed=self._cleanup_events_at(now))
 
     def _discard_expired_events_at(self, now):
@@ -730,7 +821,7 @@ class EventCache:
         构造时 discard_history_limit 容量约束），discarded 返回形状不包含
         timestamp。
         """
-        now = self.clock()
+        now = self._read_clock()
         discarded = self._discard_expired_events_at(now)
         return Result(events_removed=len(discarded), discarded=discarded)
 
@@ -756,7 +847,7 @@ class EventCache:
         事件同样以该观察时刻追加 reason='event_ttl' 的丢弃审计历史，值记录
         与去重记录的清理不写历史。
         """
-        now = self.clock()
+        now = self._read_clock()
         values_removed, dedupe_removed, events_removed = self._cleanup_all_at(now)
         return Result(
             values_removed=values_removed,
@@ -829,7 +920,7 @@ class EventCache:
     def _try_push(self, dedupe, event, window):
         # 校验失败时不读取时钟，也不产生事件或去重记录
         _check_duration(window, 'window')
-        now = self.clock()
+        now = self._read_clock()
         return self._try_push_at(dedupe, event, window, now)
 
     def push(self, dedupe, event, window):
@@ -885,7 +976,7 @@ class EventCache:
         # 校验失败时不读取时钟，也不产生事件或去重记录
         _check_duration(window, 'window')
         _check_duration(event_ttl, 'event_ttl')
-        now = self.clock()
+        now = self._read_clock()
         return self._try_push_at(dedupe, event, window, now, event_ttl)
 
     def push_batch(self, batch):
@@ -894,7 +985,7 @@ class EventCache:
         results = []
         if entries:
             # 整批使用同一时钟时刻，时间源只读取一次
-            now = self.clock()
+            now = self._read_clock()
             for dedupe, event, window, event_ttl in entries:
                 # 前项已立即更新 seen 与队列占用，后项据此继续判定；旧批量入口
                 # 的结果形状不变，但入队接受同样在内部分配回执（回执不在结果中
@@ -910,7 +1001,7 @@ class EventCache:
         results = []
         if parsed:
             # 整批使用同一时钟时刻，时间源只读取一次；时钟抛出的异常原样转出
-            now = self.clock()
+            now = self._read_clock()
             for op in parsed:
                 tag = op[0]
                 if tag == 'put':
@@ -1288,7 +1379,7 @@ class EventCache:
         if limit == 0 or not self.events:
             # 显式零配额或空队列：不读时钟、不扫描、不改状态
             return Result(events=[], discarded=[])
-        now = self.clock()
+        now = self._read_clock()
         return self._pop_live_batch_at(limit, now)
 
     def _peek_live_batch_at(self, limit, now):
@@ -1333,7 +1424,7 @@ class EventCache:
         if limit == 0 or not self.events:
             # 显式零配额或空队列：不读时钟、不扫描、不改状态
             return Result(events=[], discarded=[])
-        now = self.clock()
+        now = self._read_clock()
         return self._peek_live_batch_at(limit, now)
 
     def queue_status(self):
@@ -1438,7 +1529,7 @@ class EventCache:
         # 仅在确实需要挤出时读取时钟，且整次调用只读一次；时钟异常在
         # 任何状态修改之前抛出，配置与队列保持原样
         if max_queue is not None and len(self.events) > max_queue:
-            now = self.clock()
+            now = self._read_clock()
         else:
             now = None
         return self._resize_queue_at(max_queue, policy, now)
@@ -1502,6 +1593,10 @@ class EventCache:
         （按丢弃先后排列的条目列表，每项为含 event、reason、timestamp 的
         Result）与 discard_history_limit（None 表示无限，否则为非负整数）
         两个字段；容量有限但历史暂为空（如容量为零）时同样记录容量配置。
+        clock_policy 非默认（'reject_regression'）时增加 clock_policy 与
+        last_clock_time 两个字段（后者为最近一次成功采样的实时时钟水位，
+        首次采样前为 None）；默认的 allow_regression 不写入这两个字段，
+        快照字段形状保持兼容。
         外层字典、事件列表、对齐列表与历史列表均为与缓存分离的副本，随后任一
         方增删都不会影响另一方；value、事件对象与历史中的事件对象按既有接口
         语义保留引用。
@@ -1527,6 +1622,10 @@ class EventCache:
                 for entry in self._discard_history
             ]
             snap['discard_history_limit'] = self.discard_history_limit
+        if self.clock_policy != 'allow_regression':
+            # 仅非默认策略写入时钟保护字段：默认策略快照形状保持兼容
+            snap['clock_policy'] = self.clock_policy
+            snap['last_clock_time'] = self._last_clock_time
         return snap
 
     def restore(self, snapshot):
@@ -1548,14 +1647,23 @@ class EventCache:
         历史容量为 None 或非负整数，任一非法都抛出 ValueError 且保持原状态。
         max_queue 为非负整数时事件条目数不得超过该上限（零上限只接受空队列，
         判断针对实际条目数而非过期与否），超容快照整体拒绝并抛出 ValueError，
-        不截断、不挤出、不接受后等待后续写入处理。成功后以
+        不截断、不挤出、不接受后等待后续写入处理。时钟保护的
+        clock_policy / last_clock_time 两个字段同样成对出现、皆可整体省略：
+        缺省时按 allow_regression 且无水位恢复（旧快照兼容）；显式给出时
+        clock_policy 必须合法，last_clock_time 必须是 None 或有限的绝对
+        时刻，且 allow_regression 不接受非 None 水位。任一字段非法或只给出
+        其一时整次恢复抛出 ValueError 且原状态（含当前时钟策略与水位）完全
+        保持。成功后以
         副本整体替换状态并返回 None，恢复出的容器（含对齐列表与历史）与传入
         快照相互独立。恢复后一律由本实例当前时间源按既有的 expiry <= now 边界
-        判定过期，不隐式清理、不释放队列槽位、不延长去重窗口。
+        判定过期，不隐式清理、不释放队列槽位、不延长去重窗口；恢复不读取
+        注入时钟，reject_regression 的水位以快照值为准并在此后的首次实时
+        采样时继续生效。
         """
         (values, events, event_expiries, seen, max_queue, overflow_policy,
          discard_history, discard_history_limit,
-         event_receipts, next_receipt) = _parse_snapshot(snapshot)
+         event_receipts, next_receipt,
+         clock_policy, last_clock_time) = _parse_snapshot(snapshot)
         self.values = values
         self.events = events
         self.event_expiries = event_expiries
@@ -1566,4 +1674,6 @@ class EventCache:
         self.overflow_policy = overflow_policy
         self._discard_history = discard_history
         self.discard_history_limit = discard_history_limit
+        self.clock_policy = clock_policy
+        self._last_clock_time = last_clock_time
         return None
