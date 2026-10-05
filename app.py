@@ -181,7 +181,8 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
     ('cancel', receipt)、('pop_with_receipt',)、('peek_with_receipt',)、
-    ('cleanup',)、('cleanup_all_expired',) 或 ('discard_expired_events',)；
+    ('inspect',)、('cleanup',)、('cleanup_all_expired',) 或
+    ('discard_expired_events',)；
     运行期容量调整 ('resize_queue', max_queue) 或
     ('resize_queue', max_queue, overflow_policy)（二元形式沿用当前策略）；
     allow_event_cleanup 为真时额外接受
@@ -270,6 +271,13 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         if len(item) != 1:
             raise ValueError("'%s' operation must be ('%s',)" % (tag, tag))
         return (tag,)
+    if tag == 'inspect':
+        # 只读诊断与回执 pop/peek 同属两个批次都接受的操作（不受
+        # allow_reads 限制），且不带参数；apply_batch 复用批次时钟，
+        # replay_batch 以记录 timestamp 作为观察时刻
+        if len(item) != 1:
+            raise ValueError("'inspect' operation must be ('inspect',)")
+        return ('inspect',)
     if tag == 'cleanup':
         if len(item) != 1:
             raise ValueError("'cleanup' operation must be ('cleanup',)")
@@ -347,7 +355,7 @@ def _parse_apply_batch(batch):
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
-    ('cancel', receipt)、('cleanup',)、
+    ('cancel', receipt)、('inspect',)、('cleanup',)、
     ('cleanup_all_expired',)、('discard_expired_events',)、
     ('resize_queue', max_queue[, overflow_policy]) 或
     ('cleanup_expired_events',)。
@@ -370,7 +378,7 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/renew/delete/push/push_expiring/push_with_receipt/
-    push_expiring_with_receipt/cancel/cleanup/
+    push_expiring_with_receipt/cancel/inspect/cleanup/
     cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
     ('get_with_reason', key)、('pop',)、('pop_with_receipt',)、
@@ -659,6 +667,84 @@ class EventCache:
         """
         return Result(clock_policy=self.clock_policy,
                       last_time=self._last_clock_time)
+
+    def _inspect_at(self, now):
+        # 在指定观察时刻生成只读诊断快照：本方法绝不读取注入时钟，也绝不
+        # 删除、移动、续期或补写任何 values、seen、events、event_expiries、
+        # 回执或丢弃历史（逐项扫描而不 popleft/写回）。到期边界与全部既有
+        # 路径一致：到期点 <= now 即视为到期，但到期项仍占据容器，因此计入
+        # 对应的 expired_* 计数而不在此清理。未设置事件 TTL（expiry 为
+        # None）的事件始终计入 live_event_count，也不参与 next_event_expiry。
+        value_count = 0
+        expired_value_count = 0
+        next_value_expiry = None
+        for _key, (_value, expiry) in self.values.items():
+            if expiry <= now:
+                expired_value_count += 1
+            else:
+                value_count += 1
+                if next_value_expiry is None or expiry < next_value_expiry:
+                    next_value_expiry = expiry
+        dedupe_count = 0
+        expired_dedupe_count = 0
+        next_dedupe_expiry = None
+        for expiry in self.seen.values():
+            if expiry <= now:
+                expired_dedupe_count += 1
+            else:
+                dedupe_count += 1
+                if next_dedupe_expiry is None or expiry < next_dedupe_expiry:
+                    next_dedupe_expiry = expiry
+        live_event_count = 0
+        expired_event_count = 0
+        next_event_expiry = None
+        for expiry in self.event_expiries:
+            if expiry is None:
+                # 未设置事件 TTL 的事件始终存活，且没有到期点
+                live_event_count += 1
+            elif expiry <= now:
+                expired_event_count += 1
+            else:
+                live_event_count += 1
+                if next_event_expiry is None or expiry < next_event_expiry:
+                    next_event_expiry = expiry
+        # queue_size 是排队条目总数（含仍占槽位的到期事件）；
+        # discard_history_size 只报告长度，不返回历史条目本身
+        return Result(
+            observed_at=now,
+            value_count=value_count,
+            expired_value_count=expired_value_count,
+            dedupe_count=dedupe_count,
+            expired_dedupe_count=expired_dedupe_count,
+            queue_size=len(self.events),
+            live_event_count=live_event_count,
+            expired_event_count=expired_event_count,
+            next_value_expiry=next_value_expiry,
+            next_dedupe_expiry=next_dedupe_expiry,
+            next_event_expiry=next_event_expiry,
+            discard_history_size=len(self._discard_history),
+        )
+
+    def inspect(self):
+        """只读诊断：单次读取注入时钟，报告容器内存活与到期占用情况。
+
+        整次调用只从注入时钟读取一次作为 observed_at，随后不删除、不移动、
+        不续期、不补写任何 values、seen、events/event_expiries、回执或丢弃
+        历史；调用后再执行读取、清理或 FIFO 出队，结果与未调用 inspect 时
+        完全一致。到期边界与既有路径一致：到期点 <= observed_at 即到期。
+        value_count/dedupe_count 只计未到期项；expired_value_count/
+        expired_dedupe_count/expired_event_count 只计仍占据容器的到期项
+        （惰性过期尚未清理的记录照常计数）。queue_size 为排队条目总数
+        （含仍占槽位的到期事件）；未设置事件 TTL 的事件始终计入
+        live_event_count，已到期但仍在队的带 TTL 事件计入
+        expired_event_count，二者之和等于 queue_size。三个 next_* 字段只
+        给出严格晚于 observed_at 的最早到期点，没有则为 None；
+        discard_history_size 只报告丢弃历史条数。空容器仍返回全部字段。
+        reject_regression 下时钟回退时抛出 ClockRegressionError 且状态与
+        水位均不变；时钟自身抛出的其他异常原样传播。
+        """
+        now = self._read_clock()
+        return self._inspect_at(now)
 
     def _put_at(self, key, value, ttl, now):
         # 以写入时刻加 ttl 记录到期点，并替换同 key 旧值；ttl 由调用方先行校验
@@ -1103,6 +1189,10 @@ class EventCache:
                     results.append(self.pop_with_receipt())
                 elif tag == 'peek_with_receipt':
                     results.append(self.peek_with_receipt())
+                elif tag == 'inspect':
+                    # 复用整批唯一一次时钟读数，反映此前操作且不改变任何状态，
+                    # 因此不影响同批后续操作的判定
+                    results.append(self._inspect_at(now))
                 elif tag == 'cleanup':
                     values_removed, dedupe_removed = self._cleanup_at(now)
                     results.append(Result(
@@ -1142,8 +1232,8 @@ class EventCache:
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
         put/renew/delete/push/push_expiring/push_with_receipt/
-        push_expiring_with_receipt/cancel/cleanup/cleanup_all_expired/
-        discard_expired_events/resize_queue 与
+        push_expiring_with_receipt/cancel/inspect/cleanup/
+        cleanup_all_expired/discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
         ('get', key)、('get_with_reason', key)、('pop',)、
         ('pop_with_receipt',)、('pop_batch'[, limit])、('peek'[, limit])、
@@ -1206,7 +1296,13 @@ class EventCache:
         Result(event, receipt) 项的普通 list（空队列为空列表），
         pop_live_batch/peek_live_batch 为含
         events/discarded 两个 list 的 Result，queue_status 为含
-        size/max_queue 的 Result。回放写入的绝对到期时间与常规路径一致，
+        size/max_queue 的 Result，inspect 为含
+        observed_at/value_count/expired_value_count/dedupe_count/
+        expired_dedupe_count/queue_size/live_event_count/expired_event_count/
+        next_value_expiry/next_dedupe_expiry/next_event_expiry/
+        discard_history_size 十二个字段的 Result（observed_at 取记录自带
+        timestamp，同一记录序列在同构初始状态上得到相同结果；查询不改变任何
+        状态，故不影响同批后续记录）。回放写入的绝对到期时间与常规路径一致，
         可由 snapshot 保存并由 restore 恢复。
         """
         # 先完整校验记录结构、时间戳单调性、操作、limit 与键：在此之前不读取时钟、不改变任何状态
@@ -1311,6 +1407,10 @@ class EventCache:
             elif tag == 'peek_with_receipt':
                 # 与 peek 同为只读、不读时间，项为含 event/receipt 的 Result
                 results.append(self.peek_with_receipt())
+            elif tag == 'inspect':
+                # 只读诊断：以记录自带 timestamp 作为 observed_at，全程不
+                # 读取注入时钟；不改变任何状态，因此不影响同批后续记录
+                results.append(self._inspect_at(now))
             elif tag == 'pop_live_batch':
                 _, limit = op
                 # 按记录时刻判定事件 TTL；已扫描项目出队，未扫描尾部原样保留
