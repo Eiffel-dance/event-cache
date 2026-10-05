@@ -1294,10 +1294,13 @@ class SnapshotTest(unittest.TestCase):
         return cache
 
     # ---- 快照结构与访问方式 ----
-    def test_snapshot_has_exactly_four_fields_and_result_access(self):
+    def test_snapshot_has_core_fields_and_receipt_fields_after_push(self):
         snap = self.seed().snapshot()
         self.assertIsInstance(snap, Result)
-        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        # 两次入队各分配回执 1、2，快照增加对齐的 event_receipts 与 next_receipt
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
         self.assertEqual(snap.max_queue, 3)
         self.assertEqual(snap['max_queue'], 3)
         self.assertEqual(snap.events, ['e1', 'e2'])
@@ -1307,6 +1310,18 @@ class SnapshotTest(unittest.TestCase):
         # values 与 dict.values 方法同名，属性访问仍须取到条目
         self.assertEqual(snap.values, {'k1': ('v1', 150), 'k2': ('v2', 300)})
         self.assertEqual(snap['values'], snap.values)
+        # 回执列表与 events 等长对齐、继续递增不复用
+        self.assertEqual(snap.event_receipts, [1, 2])
+        self.assertEqual(snap['event_receipts'], [1, 2])
+        self.assertEqual(snap.next_receipt, 3)
+
+    def test_fresh_snapshot_without_enqueue_keeps_four_fields(self):
+        # 仅 values/seen 操作、从未入队时不产生回执字段，旧四字段形状保持
+        cache = self.make(max_queue=3)
+        cache.put('k1', 'v1', 50)
+        snap = cache.snapshot()
+        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        self.assertEqual(snap.events, [])
 
     def test_snapshot_events_is_plain_list(self):
         snap = self.seed().snapshot()
@@ -1810,8 +1825,18 @@ class ExpiringSnapshotTest(unittest.TestCase):
         self.now[0] += seconds
 
     # ---- 快照格式 ----
-    def test_snapshot_without_ttl_events_keeps_four_fields(self):
+    def test_snapshot_without_ttl_events_keeps_core_and_receipt_fields(self):
         self.cache.push('d', 'e', 10)
+        snap = self.cache.snapshot()
+        # 入队即分配回执：增加对齐的 event_receipts 与 next_receipt
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
+        self.assertEqual(snap.event_receipts, [1])
+        self.assertEqual(snap.next_receipt, 2)
+
+    def test_fresh_cache_never_enqueued_keeps_four_fields(self):
+        # 从未入队（无回执分配）时旧四字段形状保持
         snap = self.cache.snapshot()
         self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
 
@@ -1820,11 +1845,16 @@ class ExpiringSnapshotTest(unittest.TestCase):
         self.cache.push_expiring('d2', 'e2', 10, 50)
         self.cache.push_expiring('d3', 'e3', 10, 5)
         snap = self.cache.snapshot()
-        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue', 'event_expiries'})
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue', 'event_expiries',
+            'event_receipts', 'next_receipt'})
         self.assertEqual(snap.events, ['e1', 'e2', 'e3'])
         self.assertEqual(snap['event_expiries'], [None, 150, 105])
         self.assertEqual(snap.event_expiries, [None, 150, 105])  # 属性访问可用
         self.assertIsInstance(snap.event_expiries, list)
+        # 回执与事件等长对齐、从 1 递增
+        self.assertEqual(snap.event_receipts, [1, 2, 3])
+        self.assertEqual(snap.next_receipt, 4)
 
     def test_snapshot_expiries_detached_from_cache(self):
         self.cache.push_expiring('d', 'e', 10, 50)
@@ -1839,11 +1869,17 @@ class ExpiringSnapshotTest(unittest.TestCase):
         snap = self.cache.snapshot()
         # 所有带 TTL 事件清空后不再有 event_expiries 字段……
         self.assertNotIn('event_expiries', snap)
-        # ……但清理动作写入了丢弃历史，按新规格历史非空时保留历史字段
+        # ……但清理动作写入了丢弃历史，按新规格历史非空时保留历史字段；
+        # 已分配过回执（两条入队），故回执字段仍保留，且存活的 plain 事件
+        # 仍对齐其回执 2，next_receipt 不复用被 TTL 清掉的 1。
         self.assertEqual(set(snap), {
             'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt',
             'discard_history', 'discard_history_limit',
         })
+        self.assertEqual(snap.events, ['plain'])
+        self.assertEqual(snap.event_receipts, [2])
+        self.assertEqual(snap.next_receipt, 3)
         self.assertEqual(len(snap.discard_history), 1)
         entry = snap.discard_history[0]
         self.assertEqual((entry.event, entry.reason), ('e', 'event_ttl'))
@@ -3003,9 +3039,15 @@ class DiscardHistorySnapshotTest(unittest.TestCase):
         cache.cleanup_expired_events()             # e1 -> (e1, event_ttl, 110)
 
     # ---- 快照字段出现条件 ----
-    def test_default_snapshot_keeps_four_fields(self):
+    def test_default_snapshot_after_push_includes_receipt_fields(self):
         cache = self.make()
         cache.push('d', 'e', 100)
+        self.assertEqual(set(cache.snapshot()), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
+
+    def test_default_snapshot_without_enqueue_keeps_four_fields(self):
+        cache = self.make()
         self.assertEqual(set(cache.snapshot()), {'values', 'events', 'seen', 'max_queue'})
 
     def test_snapshot_includes_history_when_nonempty(self):
