@@ -1294,14 +1294,21 @@ class SnapshotTest(unittest.TestCase):
         return cache
 
     # ---- 快照结构与访问方式 ----
-    def test_snapshot_has_exactly_four_fields_and_result_access(self):
+    def test_snapshot_has_core_fields_and_result_access(self):
         snap = self.seed().snapshot()
         self.assertIsInstance(snap, Result)
-        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        # 回执状态始终随快照保存：seed 入队了 e1、e2，回执为 1、2，下一个为 3
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
         self.assertEqual(snap.max_queue, 3)
         self.assertEqual(snap['max_queue'], 3)
         self.assertEqual(snap.events, ['e1', 'e2'])
         self.assertEqual(snap['events'], ['e1', 'e2'])
+        self.assertEqual(snap.event_receipts, [1, 2])
+        self.assertEqual(snap['event_receipts'], [1, 2])
+        self.assertEqual(snap.next_receipt, 3)
+        self.assertEqual(snap['next_receipt'], 3)
         self.assertEqual(snap.seen, {'d1': 110, 'd2': 200})
         self.assertEqual(snap['seen'], {'d1': 110, 'd2': 200})
         # values 与 dict.values 方法同名，属性访问仍须取到条目
@@ -1311,6 +1318,7 @@ class SnapshotTest(unittest.TestCase):
     def test_snapshot_events_is_plain_list(self):
         snap = self.seed().snapshot()
         self.assertIsInstance(snap.events, list)
+        self.assertIsInstance(snap.event_receipts, list)
 
     # ---- 纯查询：不读时钟、不过滤过期项 ----
     def test_snapshot_does_not_read_clock_or_cleanup(self):
@@ -1810,21 +1818,30 @@ class ExpiringSnapshotTest(unittest.TestCase):
         self.now[0] += seconds
 
     # ---- 快照格式 ----
-    def test_snapshot_without_ttl_events_keeps_four_fields(self):
+    def test_snapshot_without_ttl_events_keeps_core_and_receipt_fields(self):
         self.cache.push('d', 'e', 10)
         snap = self.cache.snapshot()
-        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue'})
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
+        self.assertEqual(snap.event_receipts, [1])
+        self.assertEqual(snap.next_receipt, 2)
 
     def test_snapshot_with_ttl_events_adds_aligned_expiries(self):
         self.cache.push('d1', 'e1', 10)
         self.cache.push_expiring('d2', 'e2', 10, 50)
         self.cache.push_expiring('d3', 'e3', 10, 5)
         snap = self.cache.snapshot()
-        self.assertEqual(set(snap), {'values', 'events', 'seen', 'max_queue', 'event_expiries'})
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue', 'event_expiries',
+            'event_receipts', 'next_receipt'})
         self.assertEqual(snap.events, ['e1', 'e2', 'e3'])
         self.assertEqual(snap['event_expiries'], [None, 150, 105])
         self.assertEqual(snap.event_expiries, [None, 150, 105])  # 属性访问可用
         self.assertIsInstance(snap.event_expiries, list)
+        # 回执与事件对齐：三次接受分配 1、2、3，下一个为 4
+        self.assertEqual(snap.event_receipts, [1, 2, 3])
+        self.assertEqual(snap.next_receipt, 4)
 
     def test_snapshot_expiries_detached_from_cache(self):
         self.cache.push_expiring('d', 'e', 10, 50)
@@ -1839,11 +1856,16 @@ class ExpiringSnapshotTest(unittest.TestCase):
         snap = self.cache.snapshot()
         # 所有带 TTL 事件清空后不再有 event_expiries 字段……
         self.assertNotIn('event_expiries', snap)
-        # ……但清理动作写入了丢弃历史，按新规格历史非空时保留历史字段
+        # ……但清理动作写入了丢弃历史，按新规格历史非空时保留历史字段；
+        # 回执状态始终保留：e 被清理、plain 在队（回执 2），下一个回执为 3
         self.assertEqual(set(snap), {
             'values', 'events', 'seen', 'max_queue',
             'discard_history', 'discard_history_limit',
+            'event_receipts', 'next_receipt',
         })
+        self.assertEqual(snap.events, ['plain'])
+        self.assertEqual(snap.event_receipts, [2])
+        self.assertEqual(snap.next_receipt, 3)
         self.assertEqual(len(snap.discard_history), 1)
         entry = snap.discard_history[0]
         self.assertEqual((entry.event, entry.reason), ('e', 'event_ttl'))
@@ -1874,8 +1896,18 @@ class ExpiringSnapshotTest(unittest.TestCase):
     def test_restore_old_format_gives_no_expiries(self):
         self.cache.restore({'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': None})
         self.assertEqual(list(self.cache.event_expiries), [None, None])
-        # 恢复后快照回到四字段格式
-        self.assertEqual(set(self.cache.snapshot()), {'values', 'events', 'seen', 'max_queue'})
+        # 旧格式事件无回执（全 None），新回执从 1 开始分配
+        self.assertEqual(list(self.cache.event_receipts), [None, None])
+        self.assertEqual(self.cache.snapshot().next_receipt, 1)
+        # 旧事件 cancel 不命中；此后接受的新事件拿到回执 1
+        self.assertEqual(self.cache.cancel(1),
+                         Result(removed=False, event=None, reason='missing'))
+        r = self.cache.push_with_receipt('d', 'c', 10)
+        self.assertEqual((r.receipt, r.accepted, r.reason), (1, True, None))
+        # 恢复后再快照：回执两字段始终出现，旧事件仍以 None 对齐
+        self.assertEqual(set(self.cache.snapshot()), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
 
     def test_restore_copies_expiries_detached_from_snapshot(self):
         self.cache.push_expiring('d', 'e', 10, 50)
@@ -3003,10 +3035,12 @@ class DiscardHistorySnapshotTest(unittest.TestCase):
         cache.cleanup_expired_events()             # e1 -> (e1, event_ttl, 110)
 
     # ---- 快照字段出现条件 ----
-    def test_default_snapshot_keeps_four_fields(self):
+    def test_default_snapshot_keeps_core_and_receipt_fields(self):
         cache = self.make()
         cache.push('d', 'e', 100)
-        self.assertEqual(set(cache.snapshot()), {'values', 'events', 'seen', 'max_queue'})
+        self.assertEqual(set(cache.snapshot()), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
 
     def test_snapshot_includes_history_when_nonempty(self):
         cache = self.make()
@@ -3052,8 +3086,12 @@ class DiscardHistorySnapshotTest(unittest.TestCase):
         cache.restore({'values': {}, 'events': [], 'seen': {}, 'max_queue': None})
         self.assertEqual(cache.discard_history(), [])
         self.assertIsNone(cache.discard_history_limit)
-        # 恢复后快照回到四字段
-        self.assertEqual(set(cache.snapshot()), {'values', 'events', 'seen', 'max_queue'})
+        # 旧快照：空对齐回执列表、计数器回到 1；快照始终含回执两字段
+        self.assertEqual(list(cache.event_receipts), [])
+        self.assertEqual(cache.snapshot().next_receipt, 1)
+        self.assertEqual(set(cache.snapshot()), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt'})
 
     def test_restore_history_only_field_implies_unlimited_limit(self):
         cache = self.make()
@@ -3358,6 +3396,416 @@ class DiscardHistoryReplayTest(unittest.TestCase):
         rebuilt.restore(snap)
         self.assertEqual([self.triple(h) for h in rebuilt.discard_history()],
                          [('e', 'event_ttl', 20)])
+
+
+class ReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def make(self, max_queue=None, overflow_policy='reject_new'):
+        return EventCache(self.clock, max_queue=max_queue,
+                          overflow_policy=overflow_policy)
+
+    # ---- 回执分配：从 1 起递增、不复用 ----
+    def test_push_with_receipt_allocates_from_one(self):
+        r1 = self.cache.push_with_receipt('d1', 'e1', 10)
+        r2 = self.cache.push_with_receipt('d2', 'e2', 10)
+        self.assertEqual(dict(r1), {'receipt': 1, 'accepted': True, 'reason': None})
+        self.assertEqual(dict(r2), {'receipt': 2, 'accepted': True, 'reason': None})
+        self.assertIsInstance(r1, Result)
+
+    def test_push_expiring_with_receipt_allocates_same_sequence(self):
+        r1 = self.cache.push_with_receipt('d1', 'e1', 10)
+        r2 = self.cache.push_expiring_with_receipt('d2', 'e2', 10, 5)
+        self.assertEqual((r1.receipt, r2.receipt), (1, 2))
+        self.assertEqual(list(self.cache.event_expiries), [None, 105])
+
+    def test_plain_push_and_other_entries_also_allocate_receipts(self):
+        # 旧入口行为不变（不返回回执），但内部同样占用回执号段
+        self.assertTrue(self.cache.push('d1', 'e1', 10))
+        r = self.cache.push_with_receipt('d2', 'e2', 10)
+        self.assertEqual(r.receipt, 2)
+        self.assertEqual([x.receipt for x in self.cache.peek_with_receipt()], [1, 2])
+
+    def test_zero_event_ttl_still_gets_receipt(self):
+        r = self.cache.push_expiring_with_receipt('d', 'e', 100, 0)
+        self.assertEqual(dict(r), {'receipt': 1, 'accepted': True, 'reason': None})
+
+    def test_receipts_not_reused_after_pop_or_cancel(self):
+        self.cache.push_with_receipt('d1', 'e1', 10)
+        self.cache.push_with_receipt('d2', 'e2', 10)
+        self.cache.pop()          # 消费 1
+        self.cache.cancel(2)      # 取消 2
+        r = self.cache.push_with_receipt('d3', 'e3', 10)
+        self.assertEqual(r.receipt, 3)  # 1、2 不复用
+
+    # ---- 拒绝：receipt 为 None、reason 受限、不消耗号 ----
+    def test_dedupe_window_rejection_has_none_receipt(self):
+        self.cache.push_with_receipt('d', 'e1', 10)
+        r = self.cache.push_with_receipt('d', 'e2', 10)
+        self.assertEqual(dict(r), {'receipt': None, 'accepted': False,
+                                   'reason': 'dedupe_window'})
+
+    def test_queue_full_rejection_has_none_receipt(self):
+        cache = self.make(max_queue=1)
+        cache.push_with_receipt('d1', 'e1', 10)
+        r = cache.push_with_receipt('d2', 'e2', 10)
+        self.assertEqual(dict(r), {'receipt': None, 'accepted': False,
+                                   'reason': 'queue_full'})
+
+    def test_rejection_does_not_consume_receipt_number(self):
+        cache = self.make(max_queue=1)
+        cache.push_with_receipt('d1', 'e1', 10)               # 1
+        cache.push_with_receipt('d2', 'e2', 10)               # queue_full
+        cache.push_with_receipt('d1', 'dup', 10)              # dedupe_window
+        cache.pop()
+        self.assertEqual(cache.push_with_receipt('d3', 'e3', 10).receipt, 2)
+
+    def test_receipt_push_validation_raises_before_clock(self):
+        for bad in (-1, float('nan'), True, None, '10'):
+            with self.assertRaises(ValueError):
+                self.cache.push_with_receipt('d', 'e', bad)
+        # event_ttl=0 合法（接受即到期）；非法的是负值/bool/None 等
+        for bad in (-1, None, True, float('inf')):
+            with self.assertRaises(ValueError):
+                self.cache.push_expiring_with_receipt('d', 'e', 10, bad)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(self.cache.queue_status().size, 0)
+
+    # ---- drop_oldest：discarded 带驱逐回执 ----
+    def test_drop_oldest_discarded_carries_evicted_receipt(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        r1 = cache.push_with_receipt('d1', 'e1', 10)
+        r2 = cache.push_with_receipt('d2', 'e2', 10)
+        self.assertEqual(r1.receipt, 1)
+        self.assertEqual(len(r2.discarded), 1)
+        self.assertEqual(dict(r2.discarded[0]),
+                         {'event': 'e1', 'reason': 'queue_full', 'receipt': 1})
+        self.assertEqual([cache.pop_with_receipt().receipt], [2])
+
+    def test_drop_oldest_evicted_old_event_has_none_receipt(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        # 旧格式恢复：在队事件无回执
+        cache.restore({
+            'values': {}, 'events': ['old'], 'seen': {}, 'max_queue': 1,
+            'overflow_policy': 'drop_oldest',
+        })
+        r = cache.push_with_receipt('d', 'new', 10)
+        self.assertEqual(r.discarded[0],
+                         Result(event='old', reason='queue_full', receipt=None))
+        self.assertEqual(cache.peek_with_receipt(), [Result(event='new', receipt=1)])
+
+    def test_old_push_with_reason_discarded_shape_unchanged(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.push('d1', 'e1', 10)
+        r = cache.push_with_reason('d2', 'e2', 10)
+        self.assertEqual(set(r.discarded[0]), {'event', 'reason'})
+
+    # ---- pop_with_receipt ----
+    def test_pop_with_receipt_hit(self):
+        self.cache.push_with_receipt('d1', 'e1', 10)
+        self.cache.push('d2', None, 10)  # None 事件也以 found=True 返回
+        self.assertEqual(self.cache.pop_with_receipt(),
+                         Result(found=True, event='e1', receipt=1))
+        r = self.cache.pop_with_receipt()
+        self.assertEqual(r.found, True)
+        self.assertIsNone(r.event)
+        self.assertEqual(r.receipt, 2)
+
+    def test_pop_with_receipt_empty_queue(self):
+        self.assertEqual(self.cache.pop_with_receipt(),
+                         Result(found=False, event=None, receipt=None))
+
+    def test_pop_with_receipt_does_not_read_clock_or_judge_ttl(self):
+        self.cache.push_expiring('d', 'e', 10, 0)  # 接受即到期
+        self.advance(100)
+        self.clock_calls[0] = 0
+        r = self.cache.pop_with_receipt()  # 过期事件照样取出
+        self.assertEqual(r, Result(found=True, event='e', receipt=1))
+        self.assertEqual(self.clock_calls[0], 0)
+
+    # ---- peek_with_receipt ----
+    def test_peek_with_receipt_returns_fifo_results(self):
+        self.cache.push_with_receipt('d1', 'a', 10)
+        self.cache.push_expiring_with_receipt('d2', 'b', 10, 50)
+        self.assertEqual(self.cache.peek_with_receipt(),
+                         [Result(event='a', receipt=1), Result(event='b', receipt=2)])
+        self.assertEqual(self.cache.queue_status().size, 2)  # 非破坏性
+
+    def test_peek_with_receipt_empty_returns_empty_list(self):
+        self.assertEqual(self.cache.peek_with_receipt(), [])
+
+    def test_peek_with_receipt_does_not_read_clock(self):
+        self.cache.push_expiring('d', 'e', 10, 0)
+        self.advance(100)
+        self.clock_calls[0] = 0
+        self.assertEqual(self.cache.peek_with_receipt(), [Result(event='e', receipt=1)])
+        self.assertEqual(self.clock_calls[0], 0)
+
+    # ---- cancel：命中语义 ----
+    def test_cancel_hit_removes_event_and_frees_slot(self):
+        cache = self.make(max_queue=2)
+        cache.push_with_receipt('d1', 'a', 10)
+        cache.push_with_receipt('d2', 'b', 10)
+        r = cache.cancel(1)
+        self.assertEqual(dict(r), {'removed': True, 'event': 'a', 'reason': None})
+        self.assertEqual(cache.pop_batch(), ['b'])  # 其余事件相对顺序不变
+        self.assertTrue(cache.push('d3', 'c', 10))  # 容量已释放
+
+    def test_cancel_middle_keeps_fifo_and_alignment(self):
+        for i, ev in enumerate(['a', 'b', 'c']):
+            self.cache.push_with_receipt('d%d' % i, ev, 10)
+        self.assertEqual(self.cache.cancel(2).removed, True)
+        self.assertEqual([x.event for x in self.cache.peek_with_receipt()], ['a', 'c'])
+        self.assertEqual([x.receipt for x in self.cache.peek_with_receipt()], [1, 3])
+
+    def test_cancel_ignores_event_ttl(self):
+        # 取消不判 event_ttl：早已到期但仍在队中的事件照样取消
+        self.cache.push_expiring('d', 'e', 100, 0)
+        self.advance(500)
+        r = self.cache.cancel(1)
+        self.assertEqual(r, Result(removed=True, event='e', reason=None))
+
+    def test_cancel_does_not_read_clock(self):
+        self.cache.push_with_receipt('d', 'e', 10)
+        self.clock_calls[0] = 0
+        self.assertEqual(self.cache.cancel(1).removed, True)
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(self.cache.cancel(99).removed, False)
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_cancel_frees_capacity_but_keeps_dedupe_window(self):
+        cache = self.make(max_queue=1)
+        cache.push('d', 'e', 100)  # 去重窗口到 200
+        self.assertEqual(cache.cancel(1).removed, True)
+        # 槽位释放但 seen 窗口保留：同去重键仍被拦截
+        self.assertEqual(cache.push_with_reason('d', 'again', 100).reason,
+                         'dedupe_window')
+        self.assertIn('d', cache.seen)
+        # 其他去重键可使用释放出的槽位
+        self.assertTrue(cache.push('d2', 'new', 100))
+
+    def test_cancel_does_not_write_discard_history(self):
+        self.cache.push_with_receipt('d', 'e', 10)
+        self.cache.cancel(1)
+        self.assertEqual(self.cache.discard_history(), [])
+
+    # ---- cancel：未命中（未知/已出队/已取消） ----
+    def test_cancel_unknown_popped_cancelled_return_missing(self):
+        self.cache.push_with_receipt('d1', 'a', 10)
+        self.cache.push_with_receipt('d2', 'b', 10)
+        missing = Result(removed=False, event=None, reason='missing')
+        self.assertEqual(self.cache.cancel(999), missing)       # 未知
+        self.cache.pop_with_receipt()                          # 1 已出队
+        self.assertEqual(self.cache.cancel(1), missing)
+        self.assertEqual(self.cache.cancel(2), Result(removed=True, event='b', reason=None))
+        self.assertEqual(self.cache.cancel(2), missing)        # 已取消
+
+    def test_cancel_old_none_receipt_event_misses(self):
+        self.cache.restore({'values': {}, 'events': ['a'], 'seen': {}, 'max_queue': None})
+        self.assertEqual(self.cache.cancel(1).reason, 'missing')
+
+    # ---- cancel：receipt 校验原子性 ----
+    def test_cancel_invalid_receipt_raises_value_error_atomically(self):
+        self.cache.push_with_receipt('d', 'e', 10)
+        self.cache.push_with_receipt('d2', 'f', 10)
+        for bad in (0, -1, True, False, 1.5, 2.0, '1', None, 1j):
+            with self.assertRaises(ValueError):
+                self.cache.cancel(bad)
+        self.assertEqual(self.clock_calls[0], 2)  # 只有两次 push 读过
+        self.assertEqual([x.receipt for x in self.cache.peek_with_receipt()], [1, 2])
+
+    # ---- apply_batch：回执相关操作与整批校验 ----
+    def test_apply_batch_receipt_operations(self):
+        results = self.cache.apply_batch([
+            ('push_with_receipt', 'd1', 'e1', 10),
+            ('push_expiring_with_receipt', 'd2', 'e2', 10, 50),
+            ('peek_with_receipt',),
+            ('cancel', 1),
+            ('pop_with_receipt',),
+        ])
+        self.assertEqual(results[0], Result(receipt=1, accepted=True, reason=None))
+        self.assertEqual(results[1].receipt, 2)
+        self.assertEqual(results[2],
+                         [Result(event='e1', receipt=1), Result(event='e2', receipt=2)])
+        self.assertEqual(results[3], Result(removed=True, event='e1', reason=None))
+        self.assertEqual(results[4], Result(found=True, event='e2', receipt=2))
+
+    def test_apply_batch_receipt_push_rejection_shape(self):
+        results = self.cache.apply_batch([
+            ('push_with_receipt', 'd', 'e1', 10),
+            ('push_with_receipt', 'd', 'e2', 10),
+        ])
+        self.assertEqual(results[0].receipt, 1)
+        self.assertEqual(results[1],
+                         Result(receipt=None, accepted=False, reason='dedupe_window'))
+
+    def test_apply_batch_invalid_receipt_rolls_back_entire_batch(self):
+        self.cache.put('k', 'v', 100)
+        before = (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen))
+        for bad, exc in (
+            ([('push_with_receipt', 'd', 'e', 10), ('cancel', 0)], ValueError),
+            ([('push_with_receipt', 'd', 'e', -1)], ValueError),
+            ([('cancel', True)], ValueError),
+            ([('pop_with_receipt', 1)], ValueError),
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(exc):
+                self.cache.apply_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(
+            (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen)),
+            before)
+
+    # ---- replay_batch：回执按记录时间判定、不读注入时钟 ----
+    def test_replay_batch_receipt_operations_use_record_time(self):
+        results = self.cache.replay_batch([
+            (10, ('push_with_receipt', 'd1', 'e1', 10)),       # 窗口到 20
+            (15, ('push_with_receipt', 'd1', 'dup', 10)),      # dedupe_window
+            (20, ('push_expiring_with_receipt', 'd2', 'ex', 100, 0)),
+            (20, ('peek_with_receipt',)),
+            (30, ('cancel', 2)),                               # 不判 TTL，照样取消
+            (30, ('pop_with_receipt',)),
+            (30, ('pop_with_receipt',)),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)  # 全程不读注入时钟
+        self.assertEqual(results[0], Result(receipt=1, accepted=True, reason=None))
+        self.assertEqual(results[1],
+                         Result(receipt=None, accepted=False, reason='dedupe_window'))
+        self.assertEqual(results[2].receipt, 2)  # 拒绝未消耗号
+        self.assertEqual(results[3],
+                         [Result(event='e1', receipt=1), Result(event='ex', receipt=2)])
+        self.assertEqual(results[4], Result(removed=True, event='ex', reason=None))
+        self.assertEqual(results[5], Result(found=True, event='e1', receipt=1))
+        self.assertEqual(results[6], Result(found=False, event=None, receipt=None))
+
+    def test_replay_batch_invalid_receipt_rolls_back(self):
+        with self.assertRaises(ValueError):
+            self.cache.replay_batch([
+                (1, ('push_with_receipt', 'd', 'e', 10)),
+                (2, ('cancel', 0)),
+            ])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertEqual(self.cache.queue_status().size, 0)
+
+    # ---- 快照：对齐回执与计数器 ----
+    def test_snapshot_includes_aligned_receipts_and_next_receipt(self):
+        self.cache.push_with_receipt('d1', 'a', 10)
+        self.cache.push_with_receipt('d2', 'b', 10)
+        snap = self.cache.snapshot()
+        self.assertEqual(snap.event_receipts, [1, 2])
+        self.assertEqual(snap.next_receipt, 3)
+        self.assertIsInstance(snap.event_receipts, list)
+
+    def test_snapshot_keeps_counter_when_queue_emptied(self):
+        self.cache.push_with_receipt('d1', 'a', 10)
+        self.cache.cancel(1)
+        snap = self.cache.snapshot()
+        self.assertEqual(snap.event_receipts, [])
+        self.assertEqual(snap.next_receipt, 2)  # 空队列也保留号段
+
+    def test_restore_continues_numbering_with_reuse_prevention(self):
+        self.cache.push_with_receipt('d1', 'a', 10)
+        self.cache.push_with_receipt('d2', 'b', 10)
+        self.cache.pop_with_receipt()
+        target = EventCache(lambda: 0)
+        target.restore(self.cache.snapshot())
+        self.assertEqual(target.pop_with_receipt(),
+                         Result(found=True, event='b', receipt=2))
+        self.assertEqual(target.push_with_receipt('d3', 'c', 10).receipt, 3)
+
+    def test_restore_receipt_lists_detached_from_snapshot(self):
+        self.cache.push_with_receipt('d', 'e', 10)
+        snap = self.cache.snapshot()
+        target = EventCache(lambda: 0)
+        target.restore(snap)
+        snap['event_receipts'][0] = 99
+        self.assertEqual(list(target.event_receipts), [1])
+
+    def test_restore_old_snapshot_gives_none_receipts_and_counter_one(self):
+        self.cache.restore(
+            {'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': None})
+        self.assertEqual(list(self.cache.event_receipts), [None, None])
+        self.assertEqual(self.cache.snapshot().next_receipt, 1)
+        self.assertEqual(self.cache.peek_with_receipt(),
+                         [Result(event='a', receipt=None),
+                          Result(event='b', receipt=None)])
+        self.assertEqual(self.cache.cancel(1).reason, 'missing')
+        self.assertEqual(self.cache.push_with_receipt('d', 'c', 10).receipt, 1)
+
+    def test_restore_rejects_inconsistent_receipt_snapshot(self):
+        base = {'values': {}, 'events': ['e'], 'seen': {}, 'max_queue': None}
+
+        def expect_value_error(extra):
+            cache = self.make()
+            with self.assertRaises(ValueError):
+                cache.restore(dict(base, **extra))
+
+        expect_value_error({'event_receipts': [0], 'next_receipt': 2})
+        expect_value_error({'event_receipts': [True], 'next_receipt': 2})
+        expect_value_error({'event_receipts': [1.5], 'next_receipt': 2})
+        expect_value_error({'event_receipts': [5], 'next_receipt': 5})   # 须严格大于
+        expect_value_error({'event_receipts': [5], 'next_receipt': 3})
+        expect_value_error({'event_receipts': [1, 2], 'next_receipt': 3})  # 长度不符
+        expect_value_error({'event_receipts': [1]})                        # 缺一
+        expect_value_error({'next_receipt': 1})                            # 缺一
+        expect_value_error({'event_receipts': [None], 'next_receipt': True})
+
+    def test_restore_accepts_all_none_receipts(self):
+        cache = self.make()
+        cache.restore({
+            'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': None,
+            'event_receipts': [None, None], 'next_receipt': 1,
+        })
+        self.assertEqual(list(cache.event_receipts), [None, None])
+
+    def test_failed_restore_keeps_receipt_state_functional(self):
+        self.cache.push_with_receipt('d', 'e', 10)
+        with self.assertRaises(ValueError):
+            self.cache.restore({
+                'values': {}, 'events': ['x'], 'seen': {}, 'max_queue': None,
+                'event_receipts': [5], 'next_receipt': 5,
+            })
+        self.assertEqual(self.cache.pop_with_receipt(),
+                         Result(found=True, event='e', receipt=1))
+
+    # ---- 各清理/驱逐路径保持回执对齐 ----
+    def test_cleanup_and_discard_keep_receipts_aligned(self):
+        self.cache.push_expiring('d1', 'x1', 100, 0)  # 回执 1，到期
+        self.cache.push('d2', 'live', 100)            # 回执 2
+        self.cache.push_expiring('d3', 'x2', 100, 0)  # 回执 3，到期
+        self.advance(50)
+        self.cache.cleanup_expired_events()
+        self.assertEqual([x.receipt for x in self.cache.peek_with_receipt()], [2])
+        self.assertEqual([x.event for x in self.cache.peek_with_receipt()], ['live'])
+
+    def test_resize_shrink_keeps_tail_receipts_aligned(self):
+        cache = self.make(max_queue=3)
+        cache.push_with_receipt('d1', 'a', 10)
+        cache.push_with_receipt('d2', 'b', 10)
+        result = cache.resize_queue(1)  # 挤出 a（回执 1）
+        self.assertEqual([x.receipt for x in cache.peek_with_receipt()], [2])
+        # resize 的 discarded 形状保持既有两字段，不携带回执
+        self.assertEqual(set(result.discarded[0]), {'event', 'reason'})
+        self.assertEqual(result.discarded[0].event, 'a')
+
+    def test_pop_live_batch_keeps_remaining_receipts_aligned(self):
+        self.cache.push_expiring('d1', 'x', 100, 0)
+        self.cache.push('d2', 'a', 100)
+        self.advance(50)
+        self.cache.pop_live_batch()
+        self.assertEqual(self.cache.peek_with_receipt(), [])
 
 
 if __name__ == '__main__':
