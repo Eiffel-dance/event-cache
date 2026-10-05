@@ -342,10 +342,193 @@ class GetWithReasonTest(unittest.TestCase):
         self.assertEqual(cache.get_with_reason('absent').reason, 'missing')
 
 
+class RenewTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def assertRenew(self, result, renewed, value, reason, expires_at):
+        self.assertIsInstance(result, Result)
+        self.assertEqual(set(result), {'renewed', 'value', 'reason', 'expires_at'})
+        self.assertIs(result.renewed, renewed)
+        self.assertIs(result['renewed'], renewed)
+        self.assertIs(result.value, value)
+        self.assertEqual(result['reason'], reason)
+        self.assertEqual(result['expires_at'], expires_at)
+
+    # ---- 续期成功 ----
+    def test_renew_live_value_extends_expiry_without_replacing_value(self):
+        self.cache.put('a', 'v', 10)  # 到期点 110
+        r = self.cache.renew('a', 20)
+        self.assertRenew(r, True, 'v', None, 120)
+        self.assertEqual(self.cache.values['a'], ('v', 120))  # 值不变、到期点更新
+
+    def test_renew_returns_absolute_expiry_for_deterministic_replay(self):
+        self.cache.put('a', 'v', 10)
+        self.advance(5)
+        r = self.cache.renew('a', 7)
+        self.assertEqual(r.expires_at, 112)  # 观察时刻 105 + 7
+        self.assertEqual(self.cache.values['a'][1], 112)
+
+    def test_renew_preserves_falsy_values(self):
+        for key, value in (('n', None), ('f', False), ('z', 0), ('s', '')):
+            self.cache.put(key, value, 10)
+        for key, value in (('n', None), ('f', False), ('z', 0), ('s', '')):
+            r = self.cache.renew(key, 5)
+            self.assertIs(r.renewed, True)
+            self.assertIs(r.value, value)  # None/False/0/'' 原样保留
+            self.assertEqual(r.expires_at, 105)
+            self.assertIs(self.cache.values[key][0], value)
+
+    def test_renew_can_shorten_as_well_as_extend(self):
+        self.cache.put('a', 'v', 100)
+        r = self.cache.renew('a', 1)  # ttl 缩短同样合法
+        self.assertRenew(r, True, 'v', None, 101)
+
+    def test_zero_ttl_renew_succeeds_but_expires_immediately(self):
+        self.cache.put('a', 'v', 100)
+        r = self.cache.renew('a', 0)  # 观察时刻为 100：新到期点恰为 100
+        self.assertRenew(r, True, 'v', None, 100)
+        # 同一时刻边界：到期点 <= 观察时刻即过期
+        self.assertEqual(self.cache.renew('a', 1).reason, 'expired')
+
+    def test_repeated_renew_chains_expiry(self):
+        self.cache.put('a', 'v', 10)   # 到期点 110
+        self.cache.renew('a', 20)      # 观察时刻 100 -> 120
+        self.advance(15)               # 115，仍存活
+        r = self.cache.renew('a', 10)  # 125
+        self.assertRenew(r, True, 'v', None, 125)
+        self.advance(10)               # 125：边界过期
+        self.assertEqual(self.cache.renew('a', 1).reason, 'expired')
+
+    # ---- missing ----
+    def test_missing_key_returns_missing_without_clock(self):
+        r = self.cache.renew('x', 10)
+        self.assertRenew(r, False, None, 'missing', None)
+        self.assertEqual(self.clock_calls[0], 0)
+
+    def test_missing_does_not_create_entry_or_seen(self):
+        self.cache.renew('x', 10)
+        self.assertEqual(dict(self.cache.values), {})
+        self.assertEqual(dict(self.cache.seen), {})
+
+    # ---- expired ----
+    def test_expired_at_boundary_returns_expired_and_deletes(self):
+        self.cache.put('a', 'v', 10)  # 到期点 110
+        self.advance(10)
+        r = self.cache.renew('a', 20)
+        self.assertRenew(r, False, None, 'expired', None)
+        self.assertNotIn('a', self.cache.values)  # 与 get 一样删除该键
+
+    def test_expired_then_missing_on_next_renew(self):
+        self.cache.put('a', 'v', 0)
+        self.assertEqual(self.cache.renew('a', 10).reason, 'expired')
+        calls_before = self.clock_calls[0]
+        r = self.cache.renew('a', 10)
+        self.assertRenew(r, False, None, 'missing', None)
+        self.assertEqual(self.clock_calls[0], calls_before)  # missing 不读时钟
+
+    # ---- 时钟约定 ----
+    def test_reads_clock_exactly_once_when_key_exists(self):
+        self.cache.put('a', 'v', 10)
+        self.clock_calls[0] = 0
+        self.cache.renew('a', 10)
+        self.assertEqual(self.clock_calls[0], 1)
+        self.advance(100)
+        self.cache.renew('a', 10)  # 过期路径同样只读一次
+        self.assertEqual(self.clock_calls[0], 2)
+
+    # ---- 只影响 values ----
+    def test_does_not_touch_seen_events_capacity_receipts_or_history(self):
+        cache = EventCache(self.clock, max_queue=5, overflow_policy='drop_oldest')
+        cache.put('k', 'L', 100)
+        cache.push('d', 'e', 50)
+        cache.push_expiring('d2', 'ex', 50, 50)
+        before = (dict(cache.seen), list(cache.events), list(cache.event_expiries),
+                  list(cache.event_receipts), cache._next_receipt,
+                  [dict(h) for h in cache.discard_history()],
+                  cache.max_queue, cache.overflow_policy)
+        r = cache.renew('k', 90)
+        self.assertRenew(r, True, 'L', None, 190)
+        after = (dict(cache.seen), list(cache.events), list(cache.event_expiries),
+                 list(cache.event_receipts), cache._next_receipt,
+                 [dict(h) for h in cache.discard_history()],
+                 cache.max_queue, cache.overflow_policy)
+        self.assertEqual(before, after)
+
+    def test_does_not_extend_or_clean_seen(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push('d', 'e', 2)  # seen['d'] 到期点 102
+        self.advance(50)
+        self.cache.renew('k', 100)
+        self.assertEqual(self.cache.seen['d'], 102)  # seen 既不延长也不被清理
+
+    def test_does_not_batch_clean_other_expired_values(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.put('dead', 'x', 0)
+        self.advance(1)
+        self.cache.renew('k', 10)
+        self.assertIn('dead', self.cache.values)  # 不顺带清理其他过期值
+
+    # ---- 校验与原子性 ----
+    def test_invalid_ttl_raises_value_error_without_clock_or_state_change(self):
+        self.cache.put('a', 'v', 10)
+        for bad in (-1, float('nan'), float('inf'), -float('inf'), '10', None,
+                    True, False, [], {}):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(ValueError):
+                self.cache.renew('a', bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.values['a'], ('v', 110))  # 旧到期点不变
+
+    def test_unhashable_key_raises_type_error_without_clock_or_state_change(self):
+        self.cache.put('a', 'v', 100)
+        self.cache.push('d', 'e', 100)
+        before = (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen))
+        with self.assertRaises(TypeError):
+            self.cache.renew(['unhashable'], 10)
+        self.assertEqual(self.clock_calls[0], 2)  # 只有 put 与 push 读过
+        self.assertEqual(
+            (dict(self.cache.values), list(self.cache.events), dict(self.cache.seen)),
+            before)
+
+    def test_clock_exception_propagates_without_state_change(self):
+        def bad_clock():
+            raise RuntimeError('clock broken')
+
+        cache = EventCache(bad_clock)
+        cache.restore({'values': {'k': ('v', 500)}, 'events': [], 'seen': {},
+                       'max_queue': None})
+        with self.assertRaises(RuntimeError):
+            cache.renew('k', 10)
+        self.assertEqual(cache.values, {'k': ('v', 500)})
+        # 缺失路径不接触坏时钟
+        self.assertEqual(cache.renew('absent', 10).reason, 'missing')
+
+    def test_clock_regression_rejection_preserves_state(self):
+        now_box = [10]
+        cache = EventCache(lambda: now_box[0], clock_policy='reject_regression')
+        cache.put('k', 'v', 100)  # 观察时刻 10，到期点 110，水位 10
+        now_box[0] = 5
+        with self.assertRaises(app.ClockRegressionError):
+            cache.renew('k', 100)
+        self.assertEqual(cache.values['k'], ('v', 110))  # 到期点不更新
+        self.assertEqual(cache.clock_status().last_time, 10)  # 水位不回退
+
+
 class CapacityTest(unittest.TestCase):
     def setUp(self):
         self.now = [100]
-
     def make(self, max_queue):
         return EventCache(lambda: self.now[0], max_queue=max_queue)
 
@@ -844,6 +1027,77 @@ class ApplyBatchTest(unittest.TestCase):
                 cache.apply_batch(bad)
             self.assertEqual(cache.values, {})
             self.assertEqual(cache.pop_batch(), [])
+
+    # ---- renew 标签 ----
+    def test_renew_op_matches_single_renew_fields_and_shared_clock(self):
+        self.cache.put('a', 'v', 10)
+        self.cache.put('b', None, 5)
+        self.cache.put('c', 'v', 0)  # 同刻已到期
+        before = self.clock_calls[0]
+        results = self.cache.apply_batch([
+            ('renew', 'a', 20),
+            ('renew', 'missing', 1),
+            ('renew', 'b', 0),
+            ('renew', 'c', 10),
+        ])
+        self.assertEqual(self.clock_calls[0] - before, 1)  # 整批只读一次时钟
+        self.assertEqual([set(r) for r in results],
+                         [{'renewed', 'value', 'reason', 'expires_at'}] * 4)
+        self.assertTrue(results[0].renewed)
+        self.assertEqual(results[0].value, 'v')
+        self.assertIsNone(results[0].reason)
+        self.assertEqual(results[0].expires_at, 120)
+        self.assertFalse(results[1].renewed)
+        self.assertIsNone(results[1].value)
+        self.assertEqual(results[1].reason, 'missing')
+        self.assertIsNone(results[1].expires_at)
+        self.assertTrue(results[2].renewed)
+        self.assertIsNone(results[2].value)  # None 值原样保留
+        self.assertEqual(results[2].expires_at, 100)
+        self.assertEqual(results[3].reason, 'expired')  # 到期点 100 <= 观察时刻 100
+        self.assertNotIn('c', self.cache.values)
+        self.assertEqual(self.cache.values['a'], ('v', 120))
+        self.assertEqual(self.cache.values['b'], (None, 100))
+
+    def test_renew_within_batch_sees_earlier_ops_and_affects_later(self):
+        results = self.cache.apply_batch([
+            ('put', 'x', 1, 10),     # 到期点 110
+            ('renew', 'x', 100),    # 110 -> 200
+            ('renew', 'x', 1),      # 200 -> 101（续期也可缩短）
+        ])
+        self.assertEqual(results[1].expires_at, 200)
+        self.assertEqual(results[2].expires_at, 101)
+        self.assertEqual(self.cache.values['x'], (1, 101))
+
+    def test_renew_in_batch_does_not_touch_queue_or_seen(self):
+        self.cache.put('k', 'v', 10)
+        self.cache.push('d', 'e', 50)
+        before = (dict(self.cache.seen), list(self.cache.events),
+                  list(self.cache.event_receipts), self.cache._next_receipt)
+        self.cache.apply_batch([('renew', 'k', 90), ('renew', 'absent', 1)])
+        after = (dict(self.cache.seen), list(self.cache.events),
+                 list(self.cache.event_receipts), self.cache._next_receipt)
+        self.assertEqual(before, after)
+        self.assertEqual(self.cache.values['k'], ('v', 190))
+
+    def test_invalid_renew_op_rejects_whole_batch_before_clock(self):
+        self.cache.put('k', 'v', 100)
+        for bad, exc in (
+            ([('renew', 'x')], ValueError),                 # 长度不符
+            ([('renew', 'x', 1, 2)], ValueError),
+            ([('renew', 'x', -1)], ValueError),
+            ([('renew', 'x', True)], ValueError),
+            ([('renew', 'x', float('inf'))], ValueError),
+            ([('put', 'a', 1, 10), ('renew', 'x', -1)], ValueError),
+            ([('renew', ['unhashable'], 1)], TypeError),
+            ([('renew', 'x', 1), ('renew', ['u'], 1)], TypeError),
+        ):
+            calls_before = self.clock_calls[0]
+            state_before = dict(self.cache.values)
+            with self.assertRaises(exc):
+                self.cache.apply_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)  # 不读时钟
+            self.assertEqual(dict(self.cache.values), state_before)  # 无部分写入
 
 
 class PopBatchTest(unittest.TestCase):
@@ -1424,6 +1678,28 @@ class SnapshotTest(unittest.TestCase):
         rebuilt.restore(snap1)
         snap2 = rebuilt.snapshot()
         self.assertEqual(snap1, snap2)
+
+    def test_renewed_expires_at_survives_snapshot_restore(self):
+        # 续期后的绝对到期点随 values 原样保存，快照格式无需新增字段
+        cache = self.make()
+        cache.put('a', 'v', 10)    # 110
+        cache.put('n', None, 10)
+        r = cache.renew('a', 40)   # 140
+        self.assertEqual(r.expires_at, 140)
+        cache.renew('n', 0)        # None 值 + 到期点 100
+        snap = cache.snapshot()
+        self.assertEqual(snap.values['a'], ('v', 140))
+        self.assertEqual(snap.values['n'], (None, 100))
+        rebuilt = EventCache(lambda: 130)
+        rebuilt.restore(snap)
+        self.assertEqual(rebuilt.values['a'], ('v', 140))  # 130 < 140：仍存活
+        self.assertEqual(rebuilt.get('a'), 'v')
+        self.assertEqual(rebuilt.values['n'], (None, 100))  # 已到期但不隐式清理
+        # 旧四字段快照仍可恢复
+        old = EventCache(lambda: 0)
+        old.restore({'values': {'old': ('x', 999)}, 'events': [],
+                     'seen': {}, 'max_queue': None})
+        self.assertEqual(old.values, {'old': ('x', 999)})
 
     # ---- 恢复校验：失败原子、不读时钟 ----
     def assert_restore_rejected(self, cache, bad, exc_type):
@@ -2015,6 +2291,97 @@ class ReplayBatchTest(unittest.TestCase):
         results = self.cache.replay_batch([(20, ('delete', 'n')), (20, ('delete', 'n'))])
         self.assertEqual([r.deleted for r in results], [True, False])
         self.assertNotIn('n', self.cache.values)
+
+    # ---- renew 标签：以记录时刻计算绝对到期点 ----
+    def test_renew_uses_record_timestamp_and_never_reads_clock(self):
+        results = self.cache.replay_batch([
+            (100, ('put', 'a', 'v', 10)),   # 到期点 110
+            (105, ('renew', 'a', 20)),      # 105 + 20 = 125
+        ])
+        self.assertEqual(self.clock_calls[0], 0)
+        r = results[1]
+        self.assertEqual(set(r), {'renewed', 'value', 'reason', 'expires_at'})
+        self.assertTrue(r.renewed)
+        self.assertEqual(r.value, 'v')
+        self.assertIsNone(r.reason)
+        self.assertEqual(r.expires_at, 125)
+        self.assertEqual(self.cache.values['a'], ('v', 125))
+
+    def test_renew_boundary_expired_and_missing_in_replay(self):
+        results = self.cache.replay_batch([
+            (100, ('put', 'a', 'v', 10)),   # 到期点 110
+            (110, ('renew', 'a', 5)),       # 到期点 <= 记录时刻：expired 并删除
+            (111, ('renew', 'a', 5)),       # 已删除：missing
+        ])
+        self.assertFalse(results[1].renewed)
+        self.assertIsNone(results[1].value)
+        self.assertEqual(results[1].reason, 'expired')
+        self.assertIsNone(results[1].expires_at)
+        self.assertEqual(results[2].reason, 'missing')
+        self.assertNotIn('a', self.cache.values)
+
+    def test_renew_preserves_falsy_values_in_replay(self):
+        results = self.cache.replay_batch([
+            (0, ('put', 'n', None, 10)),
+            (0, ('put', 'f', False, 10)),
+            (0, ('put', 'z', 0, 10)),
+            (5, ('renew', 'n', 10)),
+            (5, ('renew', 'f', 10)),
+            (5, ('renew', 'z', 10)),
+        ])
+        for i, value in ((3, None), (4, False), (5, 0)):
+            self.assertTrue(results[i].renewed)
+            self.assertIs(results[i].value, value)
+            self.assertEqual(results[i].expires_at, 15)
+        self.assertEqual(self.cache.values['n'], (None, 15))
+        self.assertEqual(self.cache.values['f'], (False, 15))
+        self.assertEqual(self.cache.values['z'], (0, 15))
+
+    def test_renew_replay_is_deterministic_across_runs(self):
+        records = [
+            (0, ('put', 'k', 'payload', 10)),
+            (5, ('renew', 'k', 100)),
+            (10, ('renew', 'k', 1)),
+            (11, ('get_with_reason', 'k')),
+        ]
+
+        def run():
+            cache = EventCache(lambda: 999999)  # 永不被读取
+            return cache.replay_batch(records), dict(cache.values)
+
+        self.assertEqual(run(), run())
+        results, _values = run()
+        self.assertEqual(results[1].expires_at, 105)
+        self.assertEqual(results[2].expires_at, 11)
+        self.assertEqual(results[3], {'found': False, 'value': None, 'reason': 'expired'})
+
+    def test_renew_in_replay_does_not_touch_seen_or_events(self):
+        self.cache.replay_batch([
+            (0, ('put', 'k', 'v', 10)),
+            (0, ('push', 'd', 'e', 100)),   # seen['d'] 到期点 100
+            (5, ('renew', 'k', 50)),        # k -> 55
+            (50, ('renew', 'k', 151)),      # k -> 201；此刻 seen['d'] 已到期但不被清理
+            (200, ('renew', 'k', 1)),       # k（201 > 200）仍存活 -> 201；seen 仍不动
+        ])
+        self.assertEqual(self.cache.seen['d'], 100)
+        self.assertEqual(list(self.cache.events), ['e'])
+        self.assertEqual(self.cache.values['k'], ('v', 201))
+
+    def test_invalid_renew_record_raises_atomically(self):
+        self.cache.put('keep', 'v', 1000)
+        for bad, exc in (
+            ([(0, ('renew', 'x'))], ValueError),
+            ([(0, ('renew', 'x', 1, 2))], ValueError),
+            ([(0, ('renew', 'x', -1))], ValueError),
+            ([(0, ('renew', 'x', True))], ValueError),
+            ([(0, ('renew', 'x', float('nan')))], ValueError),
+            ([(0, ('renew', 'keep', 100)), (0, ('renew', 'x', -1))], ValueError),
+            ([(5, ('renew', 'x', 1)), (4, ('renew', 'x', 1))], ValueError),
+            ([(0, ('renew', ['unhashable'], 1))], TypeError),
+        ):
+            self.assert_replay_rejected(bad, exc)
+        # 校验失败不产生部分写入：keep 的到期点仍为 put 时的 1100
+        self.assertEqual(self.cache.values['keep'], ('v', 1100))
 
     def test_push_results_only_accepted_and_reason(self):
         results = self.cache.replay_batch([

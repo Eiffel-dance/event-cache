@@ -174,7 +174,8 @@ def _parse_batch(batch):
 def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     """解析并物化单条带标签操作（apply_batch 与 replay_batch 共用）。
 
-    操作必须是带标签的元组：('put', key, value, ttl)、('delete', key)、
+    操作必须是带标签的元组：('put', key, value, ttl)、('renew', key, ttl)、
+    ('delete', key)、
     ('push', dedupe, event, window)、
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
@@ -209,6 +210,13 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         _check_duration(ttl, 'ttl')
         hash(key)  # 不可哈希时原样抛出 TypeError
         return ('put', key, value, ttl)
+    if tag == 'renew':
+        if len(item) != 3:
+            raise ValueError("'renew' operation must be ('renew', key, ttl)")
+        _, key, ttl = item
+        _check_duration(ttl, 'ttl')
+        hash(key)
+        return ('renew', key, ttl)
     if tag == 'delete':
         if len(item) != 2:
             raise ValueError("'delete' operation must be ('delete', key)")
@@ -334,7 +342,7 @@ def _parse_apply_batch(batch):
     """在读取时钟或改变任何状态前完整解析并校验事务批次。
 
     批次必须可迭代，每项为带标签的元组：
-    ('put', key, value, ttl)、('delete', key)、
+    ('put', key, value, ttl)、('renew', key, ttl)、('delete', key)、
     ('push', dedupe, event, window)、
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
@@ -361,7 +369,7 @@ def _parse_replay_batch(records):
     records 必须可迭代，每项为 (timestamp, operation) 二元结构：timestamp
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
-    apply_batch 的 put/delete/push/push_expiring/push_with_receipt/
+    apply_batch 的 put/renew/delete/push/push_expiring/push_with_receipt/
     push_expiring_with_receipt/cancel/cleanup/
     cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
@@ -710,6 +718,55 @@ class EventCache:
             return Result(found=False, value=None, reason='missing')
         return self._get_with_reason_at(key, self._read_clock())
 
+    def _renew_at(self, key, ttl, now):
+        # 在指定观察时刻续期：不替换原值、不触碰事件队列。ttl 由调用方先行
+        # 校验。键不存在时直接报告 missing（实时路径因此不读取时钟）；到期点
+        # <= 观察时刻与 get 同一边界，过期则删除该值并报告 expired；仍有效时
+        # 原值（含 None、False、0 等假值）原样保留，仅把到期点改为 now + ttl。
+        # 只影响 values 这一条记录，不清 seen、不动事件与容量。
+        item = self.values.get(key)
+        if item is None:
+            return Result(renewed=False, value=None, reason='missing',
+                          expires_at=None)
+        value, expiry = item
+        if expiry <= now:
+            self.values.pop(key, None)
+            return Result(renewed=False, value=None, reason='expired',
+                          expires_at=None)
+        expires_at = now + ttl
+        self.values[key] = (value, expires_at)
+        return Result(renewed=True, value=value, reason=None,
+                      expires_at=expires_at)
+
+    def renew(self, key, ttl):
+        """在不替换值、不触碰事件队列的情况下延长仍存活键的有效期。
+
+        ttl 与 put 同一校验口径：只接受有限且不小于零的数值，布尔值、负数、
+        NaN、无穷值与其他类型统一抛出 ValueError；key 不可哈希时成员判定原样
+        抛出 TypeError。校验失败时不读取时钟、不改变任何状态。
+
+        键不存在时不读取注入时钟，返回
+        Result(renewed=False, value=None, reason='missing', expires_at=None)；
+        键存在时只读取一次注入时钟，沿用到期点 <= 观察时刻即过期的边界，
+        已过期就与 get 一样只从 values 删除该键，返回
+        Result(renewed=False, value=None, reason='expired', expires_at=None)，
+        随后再次续期同键按 missing 返回；仍有效时保留原值（None、False、0 等
+        假值同样原样保留），把绝对到期点设为观察时刻 + ttl，返回
+        Result(renewed=True, value=原值, reason=None, expires_at=新到期点)，
+        新到期点是时间轴上的绝对点，可直接用于确定性回放。
+
+        续期只影响 values：不清理也不延长 seen 去重窗口，不触碰 events、
+        event_expiries、容量与溢出策略、回执与 discard_history。时钟自身抛出
+        的异常或 reject_regression 拒绝时钟回退时原样传播，抛出前状态完全
+        保留（含不更新到期点）。
+        """
+        _check_duration(ttl, 'ttl')
+        # 与 get/get_with_reason 相同的时钟约定：键不存在时不读取注入时钟
+        if key not in self.values:
+            return Result(renewed=False, value=None, reason='missing',
+                          expires_at=None)
+        return self._renew_at(key, ttl, self._read_clock())
+
     def delete(self, key):
         # 结果只表达键是否存在，与取出的值无关：value 为 None、False、0、''
         # 等假值，或记录虽已到期但仍留在 values 中，都一样移除并返回 True；
@@ -1008,6 +1065,11 @@ class EventCache:
                     _, key, value, ttl = op
                     self._put_at(key, value, ttl, now)
                     results.append(Result(accepted=True, reason=None))
+                elif tag == 'renew':
+                    _, key, ttl = op
+                    # 与整批共享同一时钟读数：缺失与过期判定与单次 renew 一致，
+                    # 只影响 values，不触碰 seen、队列、容量、回执与历史
+                    results.append(self._renew_at(key, ttl, now))
                 elif tag == 'delete':
                     _, key = op
                     results.append(Result(deleted=self.delete(key)))
@@ -1079,7 +1141,7 @@ class EventCache:
 
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
-        put/delete/push/push_expiring/push_with_receipt/
+        put/renew/delete/push/push_expiring/push_with_receipt/
         push_expiring_with_receipt/cancel/cleanup/cleanup_all_expired/
         discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
@@ -1123,6 +1185,8 @@ class EventCache:
         时整批拒绝，缓存保持原样；key/dedupe 不可哈希时原样抛出
         TypeError。空记录返回空列表且不读取时钟。成功时返回与输入逐项
         对应、形状与各公开操作一致的结果列表：put 为 accepted/reason，
+        renew 为 renewed/value/reason/expires_at（与单次 renew 同形状，
+        到期点按记录自带时间戳计算，可确定性重放），
         push 类为 accepted 与 reason（None/dedupe_window/queue_full），
         非默认 overflow_policy 下与 push_with_reason 一样附加 discarded
         列表（被挤出队首的事件记录，未挤出时为空），
@@ -1154,6 +1218,11 @@ class EventCache:
                 _, key, value, ttl = op
                 self._put_at(key, value, ttl, now)
                 results.append(Result(accepted=True, reason=None))
+            elif tag == 'renew':
+                _, key, ttl = op
+                # 以记录自带时刻为观察点计算新到期点，不读取注入时钟；
+                # missing/expired/续期成功三种结果与单次 renew 字段一致
+                results.append(self._renew_at(key, ttl, now))
             elif tag == 'delete':
                 _, key = op
                 # delete 本身不读取时钟，语义与单项/批量入口一致

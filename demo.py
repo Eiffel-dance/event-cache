@@ -24,3 +24,11 @@ print('push event-1 窗口后:', c.push_with_reason('event-1', {'type': 'again'}
 
 # FIFO 出队，空队列返回 None
 print('pop:', c.pop(), '| pop:', c.pop(), '| pop:', c.pop())
+
+# renew：不替换值、不触碰事件队列，延长仍存活键并回报绝对到期点
+now[0] = 120
+c.put('session', 'user-7', 30)        # 到期点 150
+print('renew session:', c.renew('session', 60))  # 新到期点 180
+print('renew missing:', c.renew('nope', 10))
+now[0] = 180                          # 恰好到期：<= 边界视为过期
+print('renew expired:', c.renew('session', 10))
