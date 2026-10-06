@@ -4147,6 +4147,132 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(self.cache.pop_with_receipt(),
                          Result(found=True, event='e', receipt=1))
 
+    # ---- restore：None 占位、编号间隔与严格递增/唯一性边界 ----
+    def test_restore_accepts_none_placeholders_and_gaps(self):
+        # 允许 None 占位与历史取消/出队/驱逐造成的编号间隔；过滤 None 后
+        # 只需唯一严格递增，编号无需连续
+        cache = self.make()
+        cache.restore({
+            'values': {},
+            'events': ['a', 'b', 'c', 'd'],
+            'seen': {}, 'max_queue': None,
+            'event_receipts': [None, 3, None, 7],
+            'next_receipt': 9,
+        })
+        self.assertEqual(list(cache.event_receipts), [None, 3, None, 7])
+        self.assertEqual(cache.snapshot().next_receipt, 9)
+        # None 占位旧事件不可 cancel；有号事件按原回执命中
+        self.assertEqual(cache.cancel(3),
+                         Result(removed=True, event='b', reason=None))
+        self.assertEqual(cache.cancel(1).reason, 'missing')
+        # 新事件只从 next_receipt 分配，间隔号（1、2、4、5、6、8）不复用
+        self.assertEqual(cache.push_with_receipt('d', 'e', 10).receipt, 9)
+
+    def test_restore_requires_strictly_increasing_across_none_placeholders(self):
+        # 跨 None 占位仍须严格递增：占位不重置比较基准
+        cache = self.make()
+        with self.assertRaises(ValueError):
+            cache.restore({
+                'values': {}, 'events': ['a', 'b', 'c'],
+                'seen': {}, 'max_queue': None,
+                'event_receipts': [5, None, 4], 'next_receipt': 6,
+            })
+        self.assertEqual(list(cache.events), [])
+
+    def test_restore_rejects_duplicate_receipts(self):
+        for receipts in ([2, 2], [None, 4, 4], [3, None, 3]):
+            cache = self.make()
+            with self.assertRaises(ValueError):
+                cache.restore({
+                    'values': {}, 'events': ['e'] * len(receipts),
+                    'seen': {}, 'max_queue': None,
+                    'event_receipts': receipts,
+                    'next_receipt': max(r for r in receipts if r is not None) + 1,
+                })
+            self.assertEqual(list(cache.events), [])
+
+    def test_restore_rejects_out_of_order_receipts(self):
+        for receipts in ([2, 1], [1, 3, 2], [3, None, 2]):
+            cache = self.make()
+            with self.assertRaises(ValueError):
+                cache.restore({
+                    'values': {}, 'events': ['e'] * len(receipts),
+                    'seen': {}, 'max_queue': None,
+                    'event_receipts': receipts,
+                    'next_receipt': max(r for r in receipts if r is not None) + 1,
+                })
+            self.assertEqual(list(cache.events), [])
+
+    def test_restore_real_snapshot_with_cancel_gap_preserves_sequence(self):
+        # 真实操作路径：取消中间事件后在队回执天然带编号间隔 [1, 3, 4]
+        for i, key in enumerate(('d1', 'd2', 'd3', 'd4'), start=1):
+            self.cache.push_with_receipt(key, 'e%d' % i, 100)
+        self.cache.cancel(2)
+        snap = self.cache.snapshot()
+        self.assertEqual(snap.event_receipts, [1, 3, 4])
+        self.assertEqual(snap.next_receipt, 5)
+        target = self.make()
+        target.restore(snap)
+        self.assertEqual([x.receipt for x in target.peek_with_receipt()], [1, 3, 4])
+        self.assertEqual(target.push_with_receipt('d5', 'e5', 10).receipt, 5)
+
+    def test_restore_round_trip_preserves_gaps_placeholders_order_and_counter(self):
+        # 含间隔与 None 占位的合法快照经 snapshot 再恢复应原样保留
+        crafted = {
+            'values': {},
+            'events': ['a', 'b', 'c'],
+            'seen': {}, 'max_queue': None,
+            'event_receipts': [None, 4, 9],
+            'next_receipt': 11,
+        }
+        first = self.make()
+        first.restore(crafted)
+        snap = first.snapshot()
+        self.assertEqual(snap.event_receipts, [None, 4, 9])
+        self.assertEqual(snap.next_receipt, 11)
+        second = self.make()
+        second.restore(snap)
+        self.assertEqual(list(second.event_receipts), [None, 4, 9])
+        self.assertEqual(second.snapshot().next_receipt, 11)
+        self.assertEqual([x.event for x in second.peek_with_receipt()],
+                         ['a', 'b', 'c'])
+
+    def test_restore_then_push_never_reuses_skipped_or_cancelled_numbers(self):
+        cache = self.make()
+        cache.restore({
+            'values': {}, 'events': ['a'],
+            'seen': {}, 'max_queue': None,
+            'event_receipts': [4], 'next_receipt': 6,  # 1-3 与 5 均不可复用
+        })
+        self.assertEqual(cache.cancel(4).removed, True)
+        self.assertEqual(cache.push_with_receipt('d1', 'b', 10).receipt, 6)
+        self.assertEqual(
+            cache.push_expiring_with_receipt('d2', 'c', 10, 5).receipt, 7)
+        self.assertEqual(cache.snapshot().next_receipt, 8)
+
+    def test_failed_ordering_restore_is_atomic_and_does_not_read_clock(self):
+        self.cache.push_with_receipt('d1', 'e1', 10)
+        self.cache.push_with_receipt('d2', 'e2', 10)
+        before = (list(self.cache.events),
+                  list(self.cache.event_receipts),
+                  self.cache._next_receipt)
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.restore({
+                'values': {}, 'events': ['a', 'b'],
+                'seen': {}, 'max_queue': None,
+                'event_receipts': [2, 1], 'next_receipt': 3,
+            })
+        # 校验完成前不读取注入时钟、不写入任何字段
+        self.assertEqual(self.clock_calls[0], calls_before)
+        after = (list(self.cache.events),
+                 list(self.cache.event_receipts),
+                 self.cache._next_receipt)
+        self.assertEqual(before, after)
+        # 原状态仍遵守既有回执语义：1 可取消，新号从 3 分配
+        self.assertEqual(self.cache.cancel(1).removed, True)
+        self.assertEqual(self.cache.push_with_receipt('d3', 'e3', 10).receipt, 3)
+
     # ---- 各清理/驱逐路径保持回执对齐 ----
     def test_cleanup_and_discard_keep_receipts_aligned(self):
         self.cache.push_expiring('d1', 'x1', 100, 0)  # 回执 1，到期

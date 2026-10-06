@@ -447,10 +447,13 @@ def _parse_snapshot(snapshot):
     None（无事件 TTL）或有限的绝对到期时刻，overflow_policy 为
     'reject_new' 或 'drop_oldest'（缺省时按 'reject_new' 解释，旧四字段
     与五字段快照因此保持兼容），event_receipts 为与 events 等长的对齐列表，
-    每项为 None（旧事件，无回执）或排除 bool 的正整数回执，next_receipt 为
-    排除 bool 的正整数，且必须严格大于 event_receipts 中的任一回执（保证
-    恢复后继续递增、不复用；旧快照缺这两个字段时回执按全 None、计数器按
-    1 解释，旧事件因此不可被 cancel 命中），discard_history 为按丢弃先后
+    每项为 None（旧事件，无回执）或排除 bool 的正整数回执；非 None 回执按
+    队列顺序（过滤 None 后）必须严格递增且不得重复，None 占位与历史取消、
+    出队、驱逐造成的编号间隔均允许，只要求唯一递增而不要求编号连续（旧
+    快照的全 None 回执同样允许）；next_receipt 为排除 bool 的正整数，且必须
+    严格大于 event_receipts 中的任一回执（保证恢复后继续递增、不复用；旧快照
+    缺这两个字段时回执按全 None、计数器按 1 解释，旧事件因此不可被 cancel
+    命中），discard_history 为按丢弃先后
     排列的列表，每项必须是恰好含 event、reason、timestamp 三个字段的映射：
     reason 只能是 'event_ttl' 或 'queue_full'，timestamp 只能是非 bool 的
     有限 int/float（允许负数），event 可为任意对象（含 None）；
@@ -469,8 +472,9 @@ def _parse_snapshot(snapshot):
     bool 的有限 int/float，允许负数与已过期时刻，不解释为相对时长。字段
     缺失或多余、非映射/列表容器、二元组结构不符、event_expiries/
     event_receipts/event_metadata 长度不一致、event_metadata 条目结构/
-    known 标记/到期时间非法或键不可哈希、event_receipts/next_receipt 回执非法或
-    next_receipt 不大于在队回执、overflow_policy 非法、历史条目结构/原因/
+    known 标记/到期时间非法或键不可哈希、event_receipts/next_receipt 回执
+    非法、非 None 回执在队列顺序上重复或倒序（过滤 None 后不满足唯一严格
+    递增）或 next_receipt 不大于在队回执、overflow_policy 非法、历史条目结构/原因/
     时间戳非法、discard_history_limit 非法或任一到期值为
     NaN/无穷/字符串/复合对象、max_queue 非法或 max_queue 为非负整数而事件
     条目数超过该上限（零上限只接受空队列，判断针对实际条目数而非过期与否，
@@ -544,10 +548,20 @@ def _parse_snapshot(snapshot):
             raise ValueError('snapshot event_receipts must align with events in length')
         event_receipts = deque()
         max_receipt = 0
+        # 过滤 None 后的回执必须按队列顺序严格递增且不得重复：
+        # previous_receipt 跨 None 占位保持，记录最近一个非 None 回执。
+        # 全 None（旧快照）合法，None 占位与历史取消、出队、驱逐造成的
+        # 编号间隔同样合法，只要求唯一递增而不要求编号连续。
+        previous_receipt = None
         for receipt in raw_receipts:
             if receipt is not None:
                 # 在队回执必须是排除 bool 的正整数
                 _check_receipt(receipt)
+                if previous_receipt is not None and receipt <= previous_receipt:
+                    raise ValueError(
+                        'snapshot event_receipts must be strictly increasing '
+                        'in queue order with no duplicates')
+                previous_receipt = receipt
                 if receipt > max_receipt:
                     max_receipt = receipt
             event_receipts.append(receipt)
@@ -2025,8 +2039,11 @@ class EventCache:
         两个字段成对出现、皆可整体省略：缺省时在队事件全部视为无回执旧事件
         （event_receipts 全 None，peek_with_receipt 中 receipt 为 None，
         cancel 不命中），下一个回执从 1 开始分配；给出时 event_receipts 必须与
-        events 等长对齐、每项为 None 或排除 bool 的正整数，next_receipt 必须
-        是严格大于任一对齐回执的正整数，恢复后在其基础上继续递增、绝不复用。
+        events 等长对齐、每项为 None 或排除 bool 的正整数，且非 None 回执按
+        队列顺序（过滤 None 后）必须严格递增、不得重复——None 占位与历史取消、
+        出队、驱逐造成的编号间隔均允许，编号无需连续；重复、倒序或同一编号
+        出现多次时整次恢复抛出 ValueError。next_receipt 必须是严格大于任一对齐
+        回执的正整数，恢复后在其基础上继续递增、绝不复用。
         event_metadata 字段同样可整体省略：缺省时在队事件全部视为未知键旧
         条目（dedupe_known=False，dedupe_key 与 dedupe_expires_at 为 None，
         peek_with_metadata/pop_with_metadata 因此对这些条目返回 None 字段）；
