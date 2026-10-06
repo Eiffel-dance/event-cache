@@ -191,7 +191,7 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('release_dedupe', dedupe)、
     ('cancel', receipt)、('renew_event', receipt, ttl)、
     ('pop_with_receipt',)、('peek_with_receipt',)、
-    ('inspect',)、('cleanup',)、('cleanup_all_expired',) 或
+    ('inspect',)、('inspect_receipt', receipt)、('cleanup',)、('cleanup_all_expired',) 或
     ('discard_expired_events',)；
     运行期容量调整 ('resize_queue', max_queue) 或
     ('resize_queue', max_queue, overflow_policy)（二元形式沿用当前策略）；
@@ -305,6 +305,16 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         if len(item) != 1:
             raise ValueError("'inspect' operation must be ('inspect',)")
         return ('inspect',)
+    if tag == 'inspect_receipt':
+        # 按回执的只读查询：与 inspect 同属两个批次都接受的操作（不受
+        # allow_reads 限制）；receipt 与 cancel 同一校验口径，非法
+        # （含 bool）统一 ValueError，在读时钟或改状态之前抛出
+        if len(item) != 2:
+            raise ValueError(
+                "'inspect_receipt' operation must be ('inspect_receipt', receipt)")
+        _, receipt = item
+        _check_receipt(receipt)
+        return ('inspect_receipt', receipt)
     if tag == 'cleanup':
         if len(item) != 1:
             raise ValueError("'cleanup' operation must be ('cleanup',)")
@@ -383,7 +393,8 @@ def _parse_apply_batch(batch):
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
     ('release_dedupe', dedupe)、
-    ('cancel', receipt)、('renew_event', receipt, ttl)、('inspect',)、('cleanup',)、
+    ('cancel', receipt)、('renew_event', receipt, ttl)、('inspect',)、
+    ('inspect_receipt', receipt)、('cleanup',)、
     ('cleanup_all_expired',)、('discard_expired_events',)、
     ('resize_queue', max_queue[, overflow_policy]) 或
     ('cleanup_expired_events',)。
@@ -406,7 +417,8 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/renew/delete/push/push_expiring/push_with_receipt/
-    push_expiring_with_receipt/release_dedupe/cancel/renew_event/inspect/cleanup/
+    push_expiring_with_receipt/release_dedupe/cancel/renew_event/inspect/
+    inspect_receipt/cleanup/
     cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
     ('get_with_reason', key)、('pop',)、('pop_with_receipt',)、
@@ -844,6 +856,73 @@ class EventCache:
         """
         now = self._read_clock()
         return self._inspect_at(now)
+
+    @staticmethod
+    def _inspect_receipt_missing(receipt):
+        # 回执不在队的统一结果：未知、已出队、已取消、已被 TTL 清理或
+        # drop_oldest 挤出的回执，以及旧快照中无回执的事件，都按 missing
+        # 报告；去重元数据字段按未知键旧条目的口径置为 False/None。
+        return Result(receipt=receipt, found=False, event=None,
+                      reason='missing', expires_at=None,
+                      dedupe_known=False, dedupe_key=None,
+                      dedupe_expires_at=None)
+
+    def _inspect_receipt_at(self, index, receipt, now):
+        # 在指定观察时刻只读报告一个已确认命中的排队事件：本方法绝不读取注入
+        # 时钟，也绝不删除事件、释放容量、改变 seen 或写入丢弃历史。到期边界
+        # 与全部既有路径一致：到期点 <= now 即视为到期，但 expired 只是观察
+        # 结果，实际移除仍由既有清理或实时出队完成。无事件 TTL（expiry 为
+        # None）的事件始终存活，expires_at 报告为 None。
+        event = self.events[index]
+        expiry = self.event_expiries[index]
+        metadata = self.event_metadata[index]
+        if expiry is not None and expiry <= now:
+            return Result(receipt=receipt, found=False, event=event,
+                          reason='expired', expires_at=expiry,
+                          dedupe_known=metadata.dedupe_known,
+                          dedupe_key=metadata.dedupe_key,
+                          dedupe_expires_at=metadata.dedupe_expires_at)
+        return Result(receipt=receipt, found=True, event=event,
+                      reason=None, expires_at=expiry,
+                      dedupe_known=metadata.dedupe_known,
+                      dedupe_key=metadata.dedupe_key,
+                      dedupe_expires_at=metadata.dedupe_expires_at)
+
+    def inspect_receipt(self, receipt):
+        """按回执只读查询单个排队事件，查询不改变队列。
+
+        receipt 必须是排除 bool 的正整数，否则抛出 ValueError 且不读取
+        时钟、不改变任何状态。结果固定包含 receipt、found、event、reason、
+        expires_at、dedupe_known、dedupe_key、dedupe_expires_at 八个字段。
+
+        回执不在队时——未知回执、对应事件已被 pop/pop_batch/pop_live_batch/
+        pop_with_receipt 出队、已被 cancel 取消、已被 TTL 清理或 drop_oldest/
+        resize 挤出，以及旧快照恢复的无回执事件——返回
+        Result(receipt=receipt, found=False, event=None, reason='missing',
+        expires_at=None, dedupe_known=False, dedupe_key=None,
+        dedupe_expires_at=None)，且此时不读取注入时钟。
+
+        回执仍在队时只读取一次注入时钟作为观察时刻：未到期（含无事件 TTL）
+        返回 Result(found=True, event=原事件, reason=None,
+        expires_at=绝对到期点（无事件 TTL 时为 None）)，并附入队时记录的去重
+        元数据（dedupe_known/dedupe_key/dedupe_expires_at）；观察时刻达到或
+        超过到期点（expiry <= now，与全部既有路径同一边界）则返回
+        Result(found=False, event=原事件, reason='expired',
+        expires_at=原到期点) 及该项原去重元数据。expired 只是观察结果：查询
+        不删除事件、不释放容量、不改变 seen、不写入丢弃历史，随后再次查询
+        同一回执得到相同结论，实际移除仍由既有清理或实时出队完成。
+
+        reject_regression 下时钟回退时抛出 ClockRegressionError 且状态与
+        水位均不变；时钟自身抛出的其他异常原样传播。
+        """
+        # 回执非法（含 bool、0、负数、浮点数、字符串等）统一 ValueError，
+        # 在校验阶段抛出，不读取时钟也不触碰任何状态
+        _check_receipt(receipt)
+        index = self._receipt_index(receipt)
+        if index is None:
+            # 未知、已出队、已取消、已清理或已挤出：不读取注入时钟
+            return self._inspect_receipt_missing(receipt)
+        return self._inspect_receipt_at(index, receipt, self._read_clock())
 
     def _put_at(self, key, value, ttl, now):
         # 以写入时刻加 ttl 记录到期点，并替换同 key 旧值；ttl 由调用方先行校验
@@ -1351,6 +1430,15 @@ class EventCache:
                     # 复用整批唯一一次时钟读数，反映此前操作且不改变任何状态，
                     # 因此不影响同批后续操作的判定
                     results.append(self._inspect_at(now))
+                elif tag == 'inspect_receipt':
+                    _, receipt = op
+                    # 与整批共享同一观察时刻：看到同批前序操作的结果，只读
+                    # 查询不改状态，因此不影响后续操作；回执不在队时不涉及时钟
+                    index = self._receipt_index(receipt)
+                    if index is None:
+                        results.append(self._inspect_receipt_missing(receipt))
+                    else:
+                        results.append(self._inspect_receipt_at(index, receipt, now))
                 elif tag == 'cleanup':
                     values_removed, dedupe_removed = self._cleanup_at(now)
                     results.append(Result(
@@ -1390,7 +1478,8 @@ class EventCache:
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
         put/renew/delete/push/push_expiring/push_with_receipt/
-        push_expiring_with_receipt/release_dedupe/cancel/renew_event/inspect/cleanup/
+        push_expiring_with_receipt/release_dedupe/cancel/renew_event/inspect/
+        inspect_receipt/cleanup/
         cleanup_all_expired/discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
         ('get', key)、('get_with_reason', key)、('pop',)、
@@ -1465,7 +1554,10 @@ class EventCache:
         next_value_expiry/next_dedupe_expiry/next_event_expiry/
         discard_history_size 十二个字段的 Result（observed_at 取记录自带
         timestamp，同一记录序列在同构初始状态上得到相同结果；查询不改变任何
-        状态，故不影响同批后续记录）。回放写入的绝对到期时间与常规路径一致，
+        状态，故不影响同批后续记录），inspect_receipt 为含
+        receipt/found/event/reason/expires_at/dedupe_known/dedupe_key/
+        dedupe_expires_at 八个字段的 Result（以记录自带 timestamp 判定
+        event_ttl，不读取注入时钟；查询不改变任何状态）。回放写入的绝对到期时间与常规路径一致，
         可由 snapshot 保存并由 restore 恢复。
         """
         # 先完整校验记录结构、时间戳单调性、操作、limit 与键：在此之前不读取时钟、不改变任何状态
@@ -1591,6 +1683,15 @@ class EventCache:
                 # 只读诊断：以记录自带 timestamp 作为 observed_at，全程不
                 # 读取注入时钟；不改变任何状态，因此不影响同批后续记录
                 results.append(self._inspect_at(now))
+            elif tag == 'inspect_receipt':
+                _, receipt = op
+                # 以记录自带 timestamp 作为观察时刻判定 TTL，全程不读取注入
+                # 时钟；只读查询不改状态，因此不影响同批后续记录
+                index = self._receipt_index(receipt)
+                if index is None:
+                    results.append(self._inspect_receipt_missing(receipt))
+                else:
+                    results.append(self._inspect_receipt_at(index, receipt, now))
             elif tag == 'pop_live_batch':
                 _, limit = op
                 # 按记录时刻判定事件 TTL；已扫描项目出队，未扫描尾部原样保留

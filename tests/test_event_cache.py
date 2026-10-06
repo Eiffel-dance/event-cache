@@ -5640,5 +5640,289 @@ class RenewEventTest(unittest.TestCase):
         self.assertEqual(cache.snapshot().event_expiries, [110])
 
 
+class InspectReceiptTest(unittest.TestCase):
+    FIELDS = {'receipt', 'found', 'event', 'reason', 'expires_at',
+              'dedupe_known', 'dedupe_key', 'dedupe_expires_at'}
+
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def assertMissing(self, result, receipt):
+        self.assertIsInstance(result, Result)
+        self.assertEqual(set(result), self.FIELDS)
+        self.assertEqual(result.receipt, receipt)
+        self.assertIs(result.found, False)
+        self.assertIsNone(result.event)
+        self.assertEqual(result.reason, 'missing')
+        self.assertIsNone(result.expires_at)
+        self.assertIs(result.dedupe_known, False)
+        self.assertIsNone(result.dedupe_key)
+        self.assertIsNone(result.dedupe_expires_at)
+
+    # ---- 校验 ----
+    def test_invalid_receipt_raises_without_clock_or_state_change(self):
+        self.cache.push_with_receipt('d', 'e', 100)
+        before = self.cache.snapshot()
+        calls_before = self.clock_calls[0]
+        for bad in (0, -1, 1.5, 2.0, '1', None, True, False, [], {}):
+            with self.assertRaises(ValueError):
+                self.cache.inspect_receipt(bad)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.snapshot(), before)
+
+    # ---- missing：不读取时钟 ----
+    def test_unknown_receipt_missing_and_no_clock_read(self):
+        calls_before = self.clock_calls[0]
+        self.assertMissing(self.cache.inspect_receipt(1), 1)
+        self.assertMissing(self.cache.inspect_receipt(999), 999)
+        self.assertEqual(self.clock_calls[0], calls_before)
+
+    def test_popped_cancelled_cleaned_and_evicted_receipts_are_missing(self):
+        cache = EventCache(self.clock, max_queue=2, overflow_policy='drop_oldest')
+        cache.push_expiring_with_receipt('d1', 'a', 100, 0)   # 回执 1
+        cache.push_with_receipt('d2', 'b', 100)               # 回执 2
+        cache.push_with_receipt('d3', 'c', 100)               # 回执 3，挤出回执 1
+        cache.pop()                                            # 取出回执 2
+        cache.cancel(3)                                        # 取消回执 3
+        calls_before = self.clock_calls[0]
+        for receipt in (1, 2, 3):
+            self.assertMissing(cache.inspect_receipt(receipt), receipt)
+        self.assertEqual(self.clock_calls[0], calls_before)
+
+    def test_ttl_cleaned_receipt_is_missing(self):
+        self.cache.push_expiring_with_receipt('d', 'e', 100, 5)
+        self.advance(10)
+        self.cache.cleanup_expired_events()
+        calls_before = self.clock_calls[0]
+        self.assertMissing(self.cache.inspect_receipt(1), 1)
+        self.assertEqual(self.clock_calls[0], calls_before)
+
+    def test_old_snapshot_event_without_receipt_is_missing(self):
+        self.cache.restore({
+            'values': {}, 'events': ['old'], 'seen': {}, 'max_queue': None,
+        })
+        calls_before = self.clock_calls[0]
+        self.assertMissing(self.cache.inspect_receipt(1), 1)
+        self.assertEqual(self.clock_calls[0], calls_before)
+
+    # ---- found：读取一次时钟 ----
+    def test_live_receipt_found_with_absolute_expiry_and_metadata(self):
+        self.cache.push_expiring_with_receipt('key', 'e', 50, 8)
+        calls_before = self.clock_calls[0]
+        result = self.cache.inspect_receipt(1)
+        self.assertEqual(self.clock_calls[0] - calls_before, 1)
+        self.assertEqual(set(result), self.FIELDS)
+        self.assertEqual(result.receipt, 1)
+        self.assertIs(result.found, True)
+        self.assertEqual(result.event, 'e')
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.expires_at, 108)        # 接受时刻 100 + event_ttl 8
+        self.assertIs(result.dedupe_known, True)
+        self.assertEqual(result.dedupe_key, 'key')
+        self.assertEqual(result.dedupe_expires_at, 150)  # 接受时刻 100 + window 50
+
+    def test_live_receipt_without_event_ttl_has_none_expiry(self):
+        self.cache.push_with_receipt(None, 'plain', 30)
+        result = self.cache.inspect_receipt(1)
+        self.assertIs(result.found, True)
+        self.assertIsNone(result.expires_at)
+        self.assertIs(result.dedupe_known, True)
+        self.assertIsNone(result.dedupe_key)             # 真实的 None 键
+        self.assertEqual(result.dedupe_expires_at, 130)
+
+    def test_restored_unknown_key_metadata_reported(self):
+        self.cache.restore({
+            'values': {}, 'events': ['old'], 'seen': {}, 'max_queue': None,
+            'event_receipts': [7], 'next_receipt': 8,
+        })
+        result = self.cache.inspect_receipt(7)
+        self.assertIs(result.found, True)
+        self.assertEqual(result.event, 'old')
+        self.assertIs(result.dedupe_known, False)
+        self.assertIsNone(result.dedupe_key)
+        self.assertIsNone(result.dedupe_expires_at)
+
+    # ---- expired：只是观察结果 ----
+    def test_expired_at_observation_returns_original_event_and_metadata(self):
+        self.cache.push_expiring_with_receipt('key', 'e', 50, 8)
+        self.advance(8)  # 到达 108：恰好到期
+        result = self.cache.inspect_receipt(1)
+        self.assertIs(result.found, False)
+        self.assertEqual(result.event, 'e')
+        self.assertEqual(result.reason, 'expired')
+        self.assertEqual(result.expires_at, 108)
+        self.assertIs(result.dedupe_known, True)
+        self.assertEqual(result.dedupe_key, 'key')
+        self.assertEqual(result.dedupe_expires_at, 150)
+
+    def test_expired_observation_does_not_mutate_anything(self):
+        cache = EventCache(self.clock, max_queue=1)
+        cache.push_expiring_with_receipt('key', 'e', 50, 8)
+        self.advance(10)  # 已过期
+        before = cache.snapshot()
+        result = cache.inspect_receipt(1)
+        self.assertEqual(result.reason, 'expired')
+        # 不删除事件、不释放容量、不改变 seen、不写丢弃历史
+        self.assertEqual(cache.snapshot(), before)
+        self.assertEqual(list(cache.events), ['e'])
+        self.assertEqual(cache.queue_status().size, 1)
+        self.assertIn('key', cache.seen)
+        self.assertEqual(cache.discard_history(), [])
+        # 再次查询结论相同；满队列仍按 queue_full 拒绝（槽位未释放）
+        self.assertEqual(cache.inspect_receipt(1).reason, 'expired')
+        rejected = cache.push_with_receipt('other', 'x', 100)
+        self.assertIs(rejected.accepted, False)
+        self.assertEqual(rejected.reason, 'queue_full')
+        # 实际移除仍由既有清理完成
+        self.assertEqual(cache.cleanup_expired_events().events_removed, 1)
+        self.assertMissing(cache.inspect_receipt(1), 1)
+
+    # ---- 时钟异常与回退 ----
+    def test_clock_regression_propagates_with_state_unchanged(self):
+        cache = EventCache(self.clock, clock_policy='reject_regression')
+        cache.push_expiring_with_receipt('d', 'e', 100, 50)  # 水位 100
+        self.now[0] = 50
+        with self.assertRaises(app.ClockRegressionError):
+            cache.inspect_receipt(1)
+        self.assertEqual(cache.clock_status().last_time, 100)
+        self.assertEqual(list(cache.events), ['e'])
+
+    def test_clock_exception_propagates_unchanged(self):
+        class Boom(Exception):
+            pass
+
+        def bad_clock():
+            raise Boom()
+
+        cache = EventCache(bad_clock)
+        cache.events.append('e')
+        cache.event_expiries.append(None)
+        cache.event_receipts.append(1)
+        cache.event_metadata.append(Result(
+            dedupe_known=True, dedupe_key='d', dedupe_expires_at=10))
+        with self.assertRaises(Boom):
+            cache.inspect_receipt(1)
+        self.assertEqual(list(cache.events), ['e'])
+
+    # ---- apply_batch ----
+    def test_apply_batch_inspect_receipt_sees_prior_ops_and_uses_batch_clock(self):
+        calls_before = self.clock_calls[0]
+        results = self.cache.apply_batch([
+            ('push_expiring_with_receipt', 'k', 'e', 50, 8),
+            ('inspect_receipt', 1),
+            ('inspect_receipt', 2),
+            ('cancel', 1),
+            ('inspect_receipt', 1),
+        ])
+        self.assertEqual(self.clock_calls[0] - calls_before, 1)  # 整批一次读钟
+        found = results[1]
+        self.assertEqual(set(found), self.FIELDS)
+        self.assertIs(found.found, True)
+        self.assertEqual(found.event, 'e')
+        self.assertEqual(found.expires_at, 108)
+        self.assertEqual(found.dedupe_key, 'k')
+        self.assertMissing(results[2], 2)
+        self.assertIs(results[3].removed, True)
+        self.assertMissing(results[4], 1)  # 同批前序 cancel 立即可见
+
+    def test_apply_batch_inspect_receipt_does_not_affect_later_ops(self):
+        results = self.cache.apply_batch([
+            ('push_expiring_with_receipt', 'k', 'e', 50, 0),  # 同刻到期
+            ('inspect_receipt', 1),                            # expired，但不清理
+            ('inspect',),
+            ('pop_with_receipt',),                             # 事件仍在队
+        ])
+        self.assertEqual(results[1].reason, 'expired')
+        self.assertEqual(results[2].expired_event_count, 1)
+        self.assertIs(results[3].found, True)
+        self.assertEqual(results[3].event, 'e')
+
+    def test_apply_batch_invalid_inspect_receipt_rolls_back_whole_batch(self):
+        before = self.cache.snapshot()
+        calls_before = self.clock_calls[0]
+        for bad in (
+            [('push_with_receipt', 'd', 'e', 10), ('inspect_receipt', 0)],
+            [('inspect_receipt', True)],
+            [('inspect_receipt',)],
+            [('inspect_receipt', 1, 2)],
+            [('inspect_receipt', '1')],
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.apply_batch(bad)
+        self.assertEqual(self.clock_calls[0], calls_before)
+        self.assertEqual(self.cache.snapshot(), before)
+
+    # ---- replay_batch ----
+    def test_replay_inspect_receipt_uses_record_timestamp_without_instance_clock(self):
+        instance_calls = [0]
+
+        def must_not_be_called():
+            instance_calls[0] += 1
+            return 999999
+
+        cache = EventCache(must_not_be_called)
+        results = cache.replay_batch([
+            (100, ('push_expiring_with_receipt', 'k', 'e', 50, 8)),
+            (105, ('inspect_receipt', 1)),    # 105 < 108：存活
+            (108, ('inspect_receipt', 1)),    # 108 <= 108：到期（观察结果）
+            (108, ('pop',)),                  # 查询未移除：仍能取出
+            (109, ('inspect_receipt', 1)),    # 已出队：missing
+        ])
+        self.assertEqual(instance_calls[0], 0)
+        self.assertIs(results[1].found, True)
+        self.assertEqual(results[1].expires_at, 108)
+        self.assertIs(results[2].found, False)
+        self.assertEqual(results[2].reason, 'expired')
+        self.assertEqual(results[2].event, 'e')
+        self.assertEqual(results[3], 'e')
+        self.assertMissing(results[4], 1)
+
+    def test_replay_inspect_receipt_deterministic(self):
+        records = [
+            (0, ('push_expiring_with_receipt', 'k', 'e', 50, 8)),
+            (10, ('inspect_receipt', 1)),
+        ]
+        first = EventCache(lambda: 0)
+        second = EventCache(lambda: 0)
+        r1 = first.replay_batch(records)
+        r2 = second.replay_batch(records)
+        self.assertEqual([dict(x) for x in r1], [dict(x) for x in r2])
+
+    def test_replay_invalid_inspect_receipt_rolls_back_whole_batch(self):
+        before = self.cache.snapshot()
+        for bad in (
+            [(0, ('push_with_receipt', 'd', 'e', 10)), (5, ('inspect_receipt', -1))],
+            [(0, ('inspect_receipt', False))],
+            [(0, ('inspect_receipt',))],
+        ):
+            with self.assertRaises(ValueError):
+                self.cache.replay_batch(bad)
+        self.assertEqual(self.cache.snapshot(), before)
+
+    # ---- 快照不增加落盘字段 ----
+    def test_snapshot_shape_unchanged_by_inspect_receipt(self):
+        self.cache.push_expiring_with_receipt('k', 'e', 50, 8)
+        self.cache.inspect_receipt(1)
+        snap = self.cache.snapshot()
+        self.assertEqual(set(snap), {
+            'values', 'events', 'seen', 'max_queue',
+            'event_receipts', 'next_receipt', 'event_metadata',
+            'event_expiries',
+        })
+        self.assertEqual(snap.event_receipts, [1])
+        self.assertEqual(snap.next_receipt, 2)
+
+
 if __name__ == '__main__':
     unittest.main()
