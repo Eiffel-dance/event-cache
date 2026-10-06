@@ -188,6 +188,7 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
+    ('release_dedupe', dedupe)、
     ('cancel', receipt)、('pop_with_receipt',)、('peek_with_receipt',)、
     ('inspect',)、('cleanup',)、('cleanup_all_expired',) 或
     ('discard_expired_events',)；
@@ -266,6 +267,15 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         _check_duration(event_ttl, 'event_ttl')
         hash(dedupe)
         return ('push_expiring_with_receipt', dedupe, event, window, event_ttl)
+    if tag == 'release_dedupe':
+        # 释放去重占用与 cancel 同属两个批次都接受的操作（不受 allow_reads
+        # 限制）：不读取时钟、不按时间判定，只按 seen 中是否存在记录生效
+        if len(item) != 2:
+            raise ValueError(
+                "'release_dedupe' operation must be ('release_dedupe', dedupe)")
+        _, dedupe = item
+        hash(dedupe)
+        return ('release_dedupe', dedupe)
     if tag == 'cancel':
         if len(item) != 2:
             raise ValueError("'cancel' operation must be ('cancel', receipt)")
@@ -363,6 +373,7 @@ def _parse_apply_batch(batch):
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
+    ('release_dedupe', dedupe)、
     ('cancel', receipt)、('inspect',)、('cleanup',)、
     ('cleanup_all_expired',)、('discard_expired_events',)、
     ('resize_queue', max_queue[, overflow_policy]) 或
@@ -386,7 +397,7 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/renew/delete/push/push_expiring/push_with_receipt/
-    push_expiring_with_receipt/cancel/inspect/cleanup/
+    push_expiring_with_receipt/release_dedupe/cancel/inspect/cleanup/
     cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
     ('get_with_reason', key)、('pop',)、('pop_with_receipt',)、
@@ -1202,6 +1213,26 @@ class EventCache:
         now = self._read_clock()
         return self._try_push_at(dedupe, event, window, now, event_ttl)
 
+    def release_dedupe(self, dedupe):
+        """提前结束某个去重键的窗口占用，供业务撤销或重新编排时使用。
+
+        dedupe 不可哈希时原样抛出 TypeError，此时尚未读取时钟也未改变任何
+        状态。键在 seen 中有去重占用记录时，无论其绝对到期点是否已经过去，
+        都删除该记录并返回 Result(released=True, reason=None)；键不存在时
+        返回 Result(released=False, reason='missing')。
+
+        纯去重表操作：不读取注入时钟，不触碰 values、events、event_expiries、
+        回执、队列容量与 discard_history，已排队事件继续按原 FIFO 顺序保留，
+        其回执仍可被消费或取消，去重元数据中的 dedupe_expires_at 也保持
+        入队时的记录不变。释放成功后同一去重键可以立即再次 push（新窗口从
+        新的接受时刻起算），新旧事件允许同时存在于队列中。
+        """
+        hash(dedupe)  # 不可哈希时原样抛出 TypeError
+        if dedupe in self.seen:
+            del self.seen[dedupe]
+            return Result(released=True, reason=None)
+        return Result(released=False, reason='missing')
+
     def push_batch(self, batch):
         # 先完整校验批次结构、每项 window/event_ttl 及 dedupe 可哈希性：在此之前不读取时钟、不改变任何状态
         entries = _parse_batch(batch)
@@ -1265,6 +1296,11 @@ class EventCache:
                     _, receipt = op
                     # 取消不读取时钟、不判 event_ttl：与整批观察时刻无关
                     results.append(self.cancel(receipt))
+                elif tag == 'release_dedupe':
+                    _, dedupe = op
+                    # 释放不读取时钟、不按时间判定：与整批观察时刻无关，
+                    # 前一次释放立即影响后续 push 或 release 的判定
+                    results.append(self.release_dedupe(dedupe))
                 elif tag == 'pop_with_receipt':
                     results.append(self.pop_with_receipt())
                 elif tag == 'peek_with_receipt':
@@ -1312,7 +1348,7 @@ class EventCache:
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
         put/renew/delete/push/push_expiring/push_with_receipt/
-        push_expiring_with_receipt/cancel/inspect/cleanup/
+        push_expiring_with_receipt/release_dedupe/cancel/inspect/cleanup/
         cleanup_all_expired/discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
         ('get', key)、('get_with_reason', key)、('pop',)、
@@ -1321,8 +1357,8 @@ class EventCache:
         ('peek_live_batch'[, limit]) 与 ('queue_status',)。每条记录以自己的
         timestamp 作为当前时刻计算 TTL、event_ttl 与去重窗口的绝对边界，同一
         时间戳共享该边界；回执随入队接受顺序在回放实例上继续递增，拒绝不分配
-        回执；cancel、pop_with_receipt 与 peek_with_receipt 与对应公开入口一
-        样不读取任何时钟（cancel 也不按 event_ttl 判定）；回放全程不读取注入
+        回执；cancel、release_dedupe、pop_with_receipt 与 peek_with_receipt
+        与对应公开入口一样不读取任何时钟（cancel 也不按 event_ttl 判定）；回放全程不读取注入
         时钟、不启动后台线程，记录时间的推进本身不触发 values/seen/事件的任何
         自动清理。溢出挤出（drop_oldest 的 queue_full 与 resize_queue 缩容
         挤出）、事件 TTL 清理（cleanup_expired_events、
@@ -1370,6 +1406,8 @@ class EventCache:
         get_with_reason 为含 found/value/reason 三个字段的 Result，
         push 类回执入口为 receipt/accepted/reason（非默认策略再带 discarded，
         驱逐项含 receipt），cancel 为 removed/event/reason，
+        release_dedupe 为 released/reason（释放不读取任何时钟，记录时间的
+        推进本身不触发去重记录的自动清理），
         pop_with_receipt 为含 found/event/receipt 三个字段的 Result（空队列
         found=False、event=None、receipt=None），
         pop_batch/peek 为普通 list，peek_with_receipt 为含
@@ -1429,6 +1467,11 @@ class EventCache:
                 _, receipt = op
                 # 取消不读取任何时钟（含记录时刻）：不按 event_ttl 判定
                 results.append(self.cancel(receipt))
+            elif tag == 'release_dedupe':
+                _, dedupe = op
+                # 释放不读取任何时钟（含记录时刻）：只按 seen 当前占用判定，
+                # 记录时间的推进本身不触发去重记录的任何自动清理
+                results.append(self.release_dedupe(dedupe))
             elif tag == 'cleanup':
                 values_removed, dedupe_removed = self._cleanup_at(now)
                 results.append(Result(
