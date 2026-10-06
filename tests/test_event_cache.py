@@ -5195,6 +5195,361 @@ class ReleaseDedupeTest(unittest.TestCase):
         self.assertEqual(cache.pop(), 'old-event')
 
 
+class PurgeDedupeTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 单项入口：基本返回形状 ----
+    def test_purge_existing_returns_found_released_and_removed(self):
+        pushed = self.cache.push_with_receipt('d', 'e1', 10)
+        result = self.cache.purge_dedupe('d')
+        self.assertEqual(set(result), {'found', 'released', 'removed', 'reason'})
+        self.assertIs(result.found, True)
+        self.assertIs(result.released, True)
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.removed,
+                         [Result(event='e1', receipt=pushed.receipt,
+                                 reason='dedupe_purge')])
+        self.assertNotIn('d', self.cache.seen)
+        self.assertEqual(self.cache.peek(), [])
+
+    def test_purge_missing_returns_missing(self):
+        result = self.cache.purge_dedupe('never-seen')
+        self.assertIs(result.found, False)
+        self.assertIs(result.released, False)
+        self.assertEqual(result.removed, [])
+        self.assertEqual(result.reason, 'missing')
+        self.assertEqual(self.cache.seen, {})
+
+    def test_purge_occupancy_only_after_pop(self):
+        # 事件已出队但 seen 占用仍在：只反映 released
+        self.assertTrue(self.cache.push('d', 'e1', 1000))
+        self.assertEqual(self.cache.pop(), 'e1')
+        self.assertIn('d', self.cache.seen)
+        result = self.cache.purge_dedupe('d')
+        self.assertIs(result.found, True)
+        self.assertIs(result.released, True)
+        self.assertEqual(result.removed, [])
+        self.assertIsNone(result.reason)
+        self.assertNotIn('d', self.cache.seen)
+
+    def test_purge_events_only_after_release(self):
+        # 占用已被 release_dedupe 释放、事件仍在队：只反映 removed
+        self.cache.push_with_receipt('d', 'e1', 1000)
+        self.cache.release_dedupe('d')
+        result = self.cache.purge_dedupe('d')
+        self.assertIs(result.found, True)
+        self.assertIs(result.released, False)
+        self.assertEqual([r.event for r in result.removed], ['e1'])
+        self.assertIsNone(result.reason)
+        self.assertEqual(self.cache.peek(), [])
+
+    def test_purge_removes_all_matching_events_in_fifo_order(self):
+        # push -> release -> push：同一去重键在队列中留下两条事件
+        self.cache.push_with_receipt('d', 'e1', 1000)
+        self.cache.release_dedupe('d')
+        self.cache.push_with_receipt('d', 'e2', 1000)
+        result = self.cache.purge_dedupe('d')
+        self.assertIs(result.released, True)
+        self.assertEqual([(r.event, r.receipt, r.reason) for r in result.removed],
+                         [('e1', 1, 'dedupe_purge'), ('e2', 2, 'dedupe_purge')])
+        self.assertEqual(self.cache.peek(), [])
+
+    def test_purge_keeps_other_events_order_ttl_receipts_and_dedupe(self):
+        self.cache.push_with_receipt('a', 'ea', 1000)
+        self.cache.push_expiring_with_receipt('d', 'ed', 1000, 50)
+        self.cache.push_with_receipt('b', 'eb', 1000)
+        result = self.cache.purge_dedupe('d')
+        self.assertEqual([r.event for r in result.removed], ['ed'])
+        # 剩余事件相对顺序、事件 TTL、回执与其他去重键占用不变
+        self.assertEqual(self.cache.peek(), ['ea', 'eb'])
+        self.assertEqual(self.cache.peek_with_metadata(), [
+            Result(event='ea', dedupe_key='a', dedupe_expires_at=1100,
+                   event_expires_at=None, receipt=1, dedupe_known=True),
+            Result(event='eb', dedupe_key='b', dedupe_expires_at=1100,
+                   event_expires_at=None, receipt=3, dedupe_known=True),
+        ])
+        self.assertEqual(self.cache.seen, {'a': 1100, 'b': 1100})
+        self.assertEqual(self.cache._next_receipt, 4)
+
+    def test_purge_none_key_matches_only_real_none_key(self):
+        self.cache.push_with_receipt(None, 'e-none', 1000)
+        self.cache.push_with_receipt('d', 'ed', 1000)
+        result = self.cache.purge_dedupe(None)
+        self.assertIs(result.found, True)
+        self.assertIs(result.released, True)
+        self.assertEqual([r.event for r in result.removed], ['e-none'])
+        self.assertEqual(self.cache.peek(), ['ed'])
+        self.assertIn('d', self.cache.seen)
+
+    def test_purge_does_not_match_unknown_metadata_from_old_snapshot(self):
+        # 旧快照恢复的事件 dedupe_known=False、dedupe_key=None：
+        # 撤销 None 键或其他键都不得误匹配未知元数据
+        old_snapshot = {
+            'values': {},
+            'events': ['old-event'],
+            'seen': {},
+            'max_queue': None,
+        }
+        self.cache.restore(old_snapshot)
+        result = self.cache.purge_dedupe(None)
+        self.assertIs(result.found, False)
+        self.assertEqual(result.removed, [])
+        self.assertEqual(result.reason, 'missing')
+        self.assertEqual(self.cache.peek(), ['old-event'])
+        result = self.cache.purge_dedupe('anything')
+        self.assertIs(result.found, False)
+        self.assertEqual(self.cache.peek(), ['old-event'])
+
+    # ---- 不读取时钟；不做任何时间判定 ----
+    def test_purge_never_reads_clock(self):
+        self.cache.push('d', 'e1', 10)
+        before = self.clock_calls[0]
+        self.cache.purge_dedupe('d')
+        self.cache.purge_dedupe('d')  # missing 同样不读时钟
+        self.cache.purge_dedupe('other')
+        self.assertEqual(self.clock_calls[0], before)
+
+    def test_purge_removes_occupancy_even_after_expiry_point_passed(self):
+        self.cache.push('d', 'e1', 10)  # 去重到期点 110
+        self.advance(100)
+        # 不做任何清理：惰性过期记录仍在 seen 中，撤销照样删除并报 released
+        self.assertIn('d', self.cache.seen)
+        result = self.cache.purge_dedupe('d')
+        self.assertIs(result.released, True)
+        self.assertNotIn('d', self.cache.seen)
+
+    def test_purge_removes_expired_event_without_ttl_judgement(self):
+        # 已到期但仍占槽的携带该键事件照样移除；其他键的到期事件不受影响
+        self.cache.push_expiring_with_receipt('d', 'ed', 1000, 10)
+        self.cache.push_expiring_with_receipt('x', 'ex', 1000, 10)
+        self.advance(100)  # 两个事件 TTL 都已到期，均未清理
+        result = self.cache.purge_dedupe('d')
+        self.assertEqual([r.event for r in result.removed], ['ed'])
+        # 其他键的到期事件原样留队，撤销不做 TTL 判定也不触发清理
+        self.assertEqual(self.cache.peek(), ['ex'])
+        self.assertEqual(self.cache.queue_status(), Result(size=1, max_queue=None))
+
+    def test_purge_does_not_write_discard_history_or_reuse_receipts(self):
+        cache = EventCache(self.clock, discard_history_limit=10)
+        cache.push_with_receipt('d', 'e1', 1000)
+        result = cache.purge_dedupe('d')
+        self.assertEqual([r.receipt for r in result.removed], [1])
+        self.assertEqual(cache.discard_history(), [])
+        # 回执号不复用：下一个入队事件分配到 2
+        pushed = cache.push_with_receipt('d', 'e2', 1000)
+        self.assertEqual(pushed.receipt, 2)
+        # 被撤销事件的回执按 missing 报告
+        self.assertEqual(cache.cancel(1),
+                         Result(removed=False, event=None, reason='missing'))
+
+    def test_purge_does_not_touch_values_or_other_state(self):
+        self.cache.put('k', 'v', 1000)
+        self.cache.push_with_receipt('keep', 'ek', 1000)
+        self.cache.push_with_receipt('d', 'ed', 1000)
+        values_before = dict(self.cache.values)
+        self.cache.purge_dedupe('d')
+        self.assertEqual(dict(self.cache.values), values_before)
+        self.assertIn('keep', self.cache.seen)
+        self.assertEqual(self.cache.peek(), ['ek'])
+
+    def test_purge_frees_slots_immediately_for_next_push(self):
+        cache = EventCache(self.clock, max_queue=1)
+        cache.push('d', 'e1', 1000)
+        # 满队列时其他键被拒绝
+        self.assertEqual(cache.push_with_reason('x', 'ex', 1000).reason,
+                         'queue_full')
+        cache.purge_dedupe('d')
+        # 撤销释放的槽位立即可用
+        self.assertTrue(cache.push('x', 'ex', 1000))
+        self.assertEqual(cache.pop(), 'ex')
+
+    def test_purge_allows_immediate_repush_of_same_key(self):
+        self.cache.push('d', 'e1', 1000)
+        self.cache.purge_dedupe('d')
+        self.assertTrue(self.cache.push('d', 'e2', 1000))
+        self.assertEqual(self.cache.pop_batch(), ['e2'])
+
+    def test_purge_does_not_advance_reject_regression_watermark(self):
+        cache = EventCache(self.clock, clock_policy='reject_regression')
+        cache.push('d', 'e1', 10)  # 首次采样，水位 100
+        self.assertEqual(cache.clock_status().last_time, 100)
+        cache.purge_dedupe('d')
+        cache.purge_dedupe('missing')
+        self.assertEqual(cache.clock_status().last_time, 100)
+
+    # ---- 不可哈希键 ----
+    def test_unhashable_dedupe_raises_type_error_without_clock_or_state(self):
+        self.cache.push('d', 'e1', 10)
+        snapshot_before = self.cache.snapshot()
+        for bad in (['x'], {'y': 1}, {1, 2}):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(TypeError):
+                self.cache.purge_dedupe(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        # seen、队列、回执、历史全部不变
+        self.assertEqual(self.cache.snapshot(), snapshot_before)
+
+    # ---- apply_batch ----
+    def test_apply_batch_purge_result_shape_and_order(self):
+        self.cache.push_with_receipt('d', 'e1', 1000)
+        results = self.cache.apply_batch([
+            ('purge_dedupe', 'd'),
+            ('purge_dedupe', 'd'),
+            ('push', 'd', 'e2', 1000),
+        ])
+        self.assertEqual([set(r) for r in results],
+                         [{'found', 'released', 'removed', 'reason'},
+                          {'found', 'released', 'removed', 'reason'},
+                          {'accepted', 'reason'}])
+        self.assertIs(results[0].found, True)
+        self.assertIs(results[0].released, True)
+        self.assertEqual([r.event for r in results[0].removed], ['e1'])
+        self.assertIsNone(results[0].reason)
+        self.assertIs(results[1].found, False)
+        self.assertEqual(results[1].reason, 'missing')
+        # 撤销后同批后续 push 立即可用该键
+        self.assertTrue(results[2].accepted)
+        self.assertEqual(self.cache.pop_batch(), ['e2'])
+
+    def test_apply_batch_purge_frees_slot_for_later_push_in_batch(self):
+        cache = EventCache(self.clock, max_queue=1)
+        results = cache.apply_batch([
+            ('push', 'd', 'e1', 1000),
+            ('purge_dedupe', 'd'),
+            ('push', 'x', 'ex', 1000),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertIs(results[1].found, True)
+        # 撤销释放的槽位立即影响同批后续容量判定
+        self.assertTrue(results[2].accepted)
+        self.assertEqual(cache.pop_batch(), ['ex'])
+
+    def test_apply_batch_purge_follows_single_batch_clock_convention(self):
+        # 与 release_dedupe 一致：非空批次整批只读一次时钟；撤销本身不另读
+        self.cache.push('d', 'e1', 1000)
+        before = self.clock_calls[0]
+        self.cache.apply_batch([('purge_dedupe', 'd'),
+                                ('purge_dedupe', 'd')])
+        self.assertEqual(self.clock_calls[0] - before, 1)
+
+    def test_apply_batch_invalid_purge_rejects_whole_batch_before_clock(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push_with_receipt('d0', 'e0', 100)
+        before = self.cache.snapshot()
+        for bad, exc in (
+            ([('purge_dedupe',)], ValueError),                    # 缺键
+            ([('purge_dedupe', 'd', 'x')], ValueError),           # 多余元素
+            ([('purge_dedupe', ['x'])], TypeError),               # 不可哈希
+            ([('purge_dedupe', 'd0'), ('push', 'd', 'e', -1)], ValueError),
+            ([('put', 'a', 1, 10), ('purge_dedupe', ['x'])], TypeError),
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(exc):
+                self.cache.apply_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)  # 预校验在前
+        # 缓存、回执、历史与时钟水位全部保持整批执行前原样
+        self.assertEqual(self.cache.snapshot(), before)
+        self.assertEqual(self.cache.clock_status().last_time, None)
+
+    # ---- replay_batch ----
+    def test_replay_purge_never_reads_injected_clock(self):
+        results = self.cache.replay_batch([
+            (0, ('push', 'd', 'e1', 100)),
+            (50, ('purge_dedupe', 'd')),
+            (50, ('purge_dedupe', 'd')),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertIs(results[1].found, True)
+        self.assertIs(results[1].released, True)
+        self.assertEqual([r.event for r in results[1].removed], ['e1'])
+        self.assertIs(results[2].found, False)
+        self.assertEqual(results[2].reason, 'missing')
+
+    def test_replay_purge_then_push_in_later_record(self):
+        results = self.cache.replay_batch([
+            (0, ('push', 'd', 'e1', 100)),    # 占用至 100
+            (20, ('purge_dedupe', 'd')),
+            (30, ('push', 'd', 'e2', 100)),   # 已撤销：接受
+        ])
+        self.assertIs(results[1].found, True)
+        self.assertTrue(results[2].accepted)
+        self.assertEqual(self.cache.pop_batch(), ['e2'])
+        self.assertEqual(self.cache.seen['d'], 130)
+
+    def test_replay_purge_removes_events_without_expiry_judgement(self):
+        # 回放不随记录时间推进触发清理：t=100 时事件（TTL 到期点 10）仍在队，
+        # 撤销照样移除；占用（到期点 10）也照样释放
+        results = self.cache.replay_batch([
+            (0, ('push_expiring', 'd', 'e1', 10, 10)),
+            (100, ('purge_dedupe', 'd')),
+        ])
+        self.assertIs(results[1].released, True)
+        self.assertEqual([r.event for r in results[1].removed], ['e1'])
+        self.assertEqual(self.cache.peek(), [])
+        # 撤销不写丢弃审计历史
+        self.assertEqual(self.cache.discard_history(), [])
+
+    def test_replay_invalid_purge_record_rejects_whole_batch(self):
+        self.cache.push('d0', 'e0', 100)
+        before = self.cache.snapshot()
+        for records, exc in (
+            ([(0, ('purge_dedupe',))], ValueError),
+            ([(0, ('purge_dedupe', 'd', 1))], ValueError),
+            ([(0, ('purge_dedupe', ['x']))], TypeError),
+            ([(10, ('purge_dedupe', 'd')), (5, ('push', 'd', 'e', 1))],
+             ValueError),  # 时间戳倒退
+        ):
+            with self.assertRaises(exc):
+                self.cache.replay_batch(records)
+        self.assertEqual(self.cache.snapshot(), before)
+
+    # ---- 快照与恢复 ----
+    def test_snapshot_roundtrip_preserves_purge_outcome(self):
+        self.cache.push('d', 'e1', 1000)
+        self.cache.push('g', 'e2', 1000)
+        self.cache.purge_dedupe('d')
+        snap = self.cache.snapshot()
+        self.assertNotIn('d', snap.seen)
+        self.assertEqual(snap.events, ['e2'])
+
+        restored = EventCache(self.clock)
+        restored.restore(snap)
+        # 恢复后准确反映撤销结果：d 无占用无事件，g 仍在窗口内
+        self.assertEqual(restored.purge_dedupe('d').reason, 'missing')
+        kept = restored.purge_dedupe('g')
+        self.assertIs(kept.found, True)
+        self.assertEqual([r.event for r in kept.removed], ['e2'])
+
+    def test_old_snapshot_without_new_fields_still_restores(self):
+        # 不增加任何必填字段：旧四字段快照恢复后撤销照常工作，
+        # 未知键旧事件不被误匹配
+        old_snapshot = {
+            'values': {},
+            'events': ['old-event'],
+            'seen': {'d': 123},
+            'max_queue': None,
+        }
+        cache = EventCache(self.clock)
+        self.assertIsNone(cache.restore(old_snapshot))
+        result = cache.purge_dedupe('d')
+        self.assertIs(result.found, True)
+        self.assertIs(result.released, True)
+        self.assertEqual(result.removed, [])
+        self.assertEqual(cache.pop(), 'old-event')
+
+
 class RenewEventTest(unittest.TestCase):
     def setUp(self):
         self.now = [100]

@@ -195,7 +195,7 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
-    ('release_dedupe', dedupe)、
+    ('release_dedupe', dedupe)、('purge_dedupe', dedupe)、
     ('cancel', receipt)、('renew_event', receipt, ttl)、
     ('inspect_receipt', receipt)、
     ('pop_with_receipt',)、('peek_with_receipt',)、
@@ -284,6 +284,14 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         _, dedupe = item
         hash(dedupe)
         return ('release_dedupe', dedupe)
+    if tag == 'purge_dedupe':
+        # 按去重键撤销排队事件：与 release_dedupe 同一校验口径，只验证
+        # 去重键可哈希；既不读取时钟也不涉及任何时长参数
+        if len(item) != 2:
+            raise ValueError("'purge_dedupe' operation must be ('purge_dedupe', dedupe)")
+        _, dedupe = item
+        hash(dedupe)
+        return ('purge_dedupe', dedupe)
     if tag == 'cancel':
         if len(item) != 2:
             raise ValueError("'cancel' operation must be ('cancel', receipt)")
@@ -400,7 +408,7 @@ def _parse_apply_batch(batch):
     ('push_expiring', dedupe, event, window, event_ttl)、
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
-    ('release_dedupe', dedupe)、
+    ('release_dedupe', dedupe)、('purge_dedupe', dedupe)、
     ('cancel', receipt)、('renew_event', receipt, ttl)、
     ('inspect_receipt', receipt)、('inspect',)、('cleanup',)、
     ('cleanup_all_expired',)、('discard_expired_events',)、
@@ -425,7 +433,7 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/renew/delete/push/push_expiring/push_with_receipt/
-    push_expiring_with_receipt/release_dedupe/cancel/renew_event/
+    push_expiring_with_receipt/release_dedupe/purge_dedupe/cancel/renew_event/
     inspect_receipt/inspect/cleanup/
     cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
@@ -1021,6 +1029,72 @@ class EventCache:
         del self.seen[dedupe]
         return Result(released=True, reason=None)
 
+    def purge_dedupe(self, dedupe):
+        """按去重键主动撤销：释放该键的去重占用，并移除队列中携带该键的所有事件。
+
+        供调用方在业务撤销时一次性撤回某个去重键的全部排队痕迹：先验证去重键
+        可哈希，不可哈希时原样抛出 TypeError，且不读取时钟、不改变任何状态。
+        随后在不读取时间源的情况下：删除 seen 中该键的去重占用记录（无论其
+        绝对到期点是否已经过去，即使按 expiry <= 当前时刻已算过期但记录仍
+        惰性留在 seen 中），并扫描整个 FIFO 队列，移除所有 event_metadata
+        标记为已知键（dedupe_known=True）且 dedupe_key 等于该键的事件。
+        dedupe 为 None 时按真实的 None 键处理：只命中 dedupe_known=True 且
+        dedupe_key 为 None 的条目，旧快照恢复的未知键条目
+        （dedupe_known=False，其 dedupe_key 恒为 None）一律不误匹配。
+
+        返回 Result(found=, released=, removed=, reason=)：found 表示去重表
+        或队列中是否找到该键（released 或 removed 非空即为 True）；released
+        表示本次是否删除了 seen 中的去重占用；removed 为按原 FIFO 顺序排列的
+        Result(event=原事件值, receipt=该事件回执或 None, reason='dedupe_purge')
+        列表，事件值为 None 时同样保留该条记录。去重表与队列中都不存在该键时
+        返回 Result(found=False, released=False, removed=[], reason='missing')；
+        只存在去重占用或只存在排队事件时对应字段如实反映，顶层 reason 为 None。
+
+        主动撤销不做任何时间判定：不读取注入时钟、不推进时钟水位，不判事件
+        TTL（已到期但仍占槽的携带该键事件照样移除，其他事件的到期状态不受
+        影响），也不判去重窗口是否已过期。被移除事件立即释放队列槽位，后续
+        push 与容量判定随即可见；剩余事件相对顺序、事件 TTL（event_expiries）、
+        回执编号（含 _next_receipt 计数，被移除事件的回执永不复用）与其他
+        去重键的占用状态全部保持不变。撤销不写入 discard_history（丢弃审计
+        只记 event_ttl 与 queue_full），不触碰 values，也不影响其他键的
+        seen 记录。纯状态操作：found/missing 两种结果都不读取时钟。
+        """
+        # 先验证可哈希：不可哈希时原样抛出 TypeError，此前不读取时钟也不改状态
+        hash(dedupe)
+        # 无论到期点是否已过都删除：撤销不做任何时间判定，也不读取时钟
+        released = dedupe in self.seen
+        if released:
+            del self.seen[dedupe]
+        # 扫描整个队列，移除携带该键元数据的事件；未知键旧条目
+        # （dedupe_known=False）不参与匹配，真实的 None 键因此不会误命中
+        removed = []
+        kept_events = deque()
+        kept_expiries = deque()
+        kept_receipts = deque()
+        kept_metadata = deque()
+        for event, expiry, receipt, metadata in zip(
+                self.events, self.event_expiries, self.event_receipts,
+                self.event_metadata):
+            if metadata.dedupe_known and metadata.dedupe_key == dedupe:
+                # 回执随事件一并出列且不复用；撤销不写丢弃审计历史
+                removed.append(Result(event=event, receipt=receipt,
+                                      reason='dedupe_purge'))
+            else:
+                kept_events.append(event)
+                kept_expiries.append(expiry)
+                kept_receipts.append(receipt)
+                kept_metadata.append(metadata)
+        if removed:
+            # 有事件出列时整体替换对齐容器：剩余事件相对顺序、到期点、
+            # 回执与去重元数据逐项保持，释放的槽位立即生效
+            self.events = kept_events
+            self.event_expiries = kept_expiries
+            self.event_receipts = kept_receipts
+            self.event_metadata = kept_metadata
+        found = released or bool(removed)
+        return Result(found=found, released=released, removed=removed,
+                      reason=None if found else 'missing')
+
     def _cleanup_at(self, now):
         values_removed = 0
         for key in [k for k, (_, expiry) in self.values.items() if expiry <= now]:
@@ -1360,6 +1434,12 @@ class EventCache:
                     # 时钟读数（与 delete/cancel 同处一个非空批次），释放结果
                     # 立即影响同批后续 push 的去重判定
                     results.append(self.release_dedupe(dedupe))
+                elif tag == 'purge_dedupe':
+                    _, dedupe = op
+                    # 单项撤销不读取时钟；整批仍共用唯一一次时钟读数（与
+                    # release_dedupe 同处一个非空批次）。撤销释放的占用与队列
+                    # 槽位立即影响同批后续 push 的去重与容量判定
+                    results.append(self.purge_dedupe(dedupe))
                 elif tag == 'push':
                     _, dedupe, event, window = op
                     # 前序操作（含 cleanup）已立即更新状态，本项据此在同一时刻判定
@@ -1460,7 +1540,7 @@ class EventCache:
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
         put/renew/delete/push/push_expiring/push_with_receipt/
-        push_expiring_with_receipt/release_dedupe/cancel/renew_event/
+        push_expiring_with_receipt/release_dedupe/purge_dedupe/cancel/renew_event/
         inspect_receipt/inspect/cleanup/
         cleanup_all_expired/discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
@@ -1511,6 +1591,10 @@ class EventCache:
         列表（被挤出队首的事件记录，未挤出时为空），
         delete 为 deleted，release_dedupe 为 released/reason（释放不读取
         注入时钟也不按记录时刻判过期，记录时刻只参与顺序校验），
+        purge_dedupe 为 found/released/removed/reason（与单项入口同形状：
+        removed 为按 FIFO 排列的 Result(event, receipt,
+        reason='dedupe_purge') 列表；撤销同样不读取注入时钟、不按记录时刻
+        判过期，记录时刻只参与顺序校验），
         cleanup 为 values_removed/dedupe_removed，
         cleanup_expired_events 为 events_removed，discard_expired_events
         为 events_removed/discarded（形状与公开方法一致），
@@ -1566,6 +1650,12 @@ class EventCache:
                 # 释放不读取注入时钟，也不使用记录时刻做时间判定；记录
                 # timestamp 只用于既有的非递减顺序校验。释放立即影响后续记录
                 results.append(self.release_dedupe(dedupe))
+            elif tag == 'purge_dedupe':
+                _, dedupe = op
+                # 撤销与释放一样不读取注入时钟、不使用记录时刻做时间判定
+                # （不判事件 TTL、不判窗口过期）；记录 timestamp 只用于既有
+                # 的非递减顺序校验。释放的占用与槽位立即影响后续记录
+                results.append(self.purge_dedupe(dedupe))
             elif tag == 'push':
                 _, dedupe, event, window = op
                 # 前序记录已立即更新状态，本记录按其自带时刻判定
