@@ -4734,5 +4734,340 @@ class QueueMetadataTest(unittest.TestCase):
         self.assertIsNone(item.dedupe_key)
 
 
+class ReleaseDedupeTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+        self.cache = EventCache(clock)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 单项入口：基本返回形状 ----
+    def test_release_existing_returns_released(self):
+        self.cache.push('d', 'e1', 10)
+        result = self.cache.release_dedupe('d')
+        self.assertEqual(set(result), {'released', 'reason'})
+        self.assertIs(result.released, True)
+        self.assertIsNone(result.reason)
+        self.assertNotIn('d', self.cache.seen)
+
+    def test_release_missing_returns_missing(self):
+        result = self.cache.release_dedupe('never-seen')
+        self.assertEqual(set(result), {'released', 'reason'})
+        self.assertIs(result.released, False)
+        self.assertEqual(result.reason, 'missing')
+        self.assertEqual(self.cache.seen, {})
+
+    def test_repeated_release_reports_true_then_missing(self):
+        self.cache.push('d', 'e1', 10)
+        first = self.cache.release_dedupe('d')
+        second = self.cache.release_dedupe('d')
+        self.assertIs(first.released, True)
+        self.assertIs(second.released, False)
+        self.assertEqual(second.reason, 'missing')
+
+    def test_none_is_a_real_dedupe_key(self):
+        self.assertTrue(self.cache.push(None, 'e1', 10))
+        released = self.cache.release_dedupe(None)
+        missing = self.cache.release_dedupe(None)
+        self.assertIs(released.released, True)
+        self.assertIs(missing.released, False)
+        self.assertEqual(missing.reason, 'missing')
+
+    # ---- 不读取时钟；到期点是否已过都删除 ----
+    def test_release_never_reads_clock(self):
+        self.cache.push('d', 'e1', 10)
+        before = self.clock_calls[0]
+        self.cache.release_dedupe('d')
+        self.cache.release_dedupe('d')  # missing 同样不读时钟
+        self.cache.release_dedupe('other')
+        self.assertEqual(self.clock_calls[0], before)
+
+    def test_release_removes_record_even_after_expiry_point_passed(self):
+        self.cache.push('d', 'e1', 10)  # 到期点 110
+        self.advance(100)
+        # 不做任何清理：惰性过期记录仍在 seen 中，释放照样删除并报 released
+        self.assertIn('d', self.cache.seen)
+        result = self.cache.release_dedupe('d')
+        self.assertIs(result.released, True)
+        self.assertNotIn('d', self.cache.seen)
+
+    def test_release_after_cleanup_reports_missing(self):
+        self.cache.push('d', 'e1', 10)
+        self.advance(11)
+        self.cache.cleanup()  # 已按既有语义清掉 seen 记录
+        result = self.cache.release_dedupe('d')
+        self.assertIs(result.released, False)
+        self.assertEqual(result.reason, 'missing')
+
+    def test_release_does_not_advance_reject_regression_watermark(self):
+        cache = EventCache(self.clock, clock_policy='reject_regression')
+        cache.push('d', 'e1', 10)  # 首次采样，水位 100
+        self.assertEqual(cache.clock_status().last_time, 100)
+        cache.release_dedupe('d')
+        cache.release_dedupe('missing')
+        # 释放不采样时钟：水位保持不变
+        self.assertEqual(cache.clock_status().last_time, 100)
+
+    # ---- 只触碰 seen ----
+    def test_release_does_not_touch_values_events_receipts_or_history(self):
+        self.cache.put('k', 'v', 1000)
+        pushed = self.cache.push_with_receipt('d', 'e1', 1000)
+        receipt = pushed.receipt
+        before = (
+            dict(self.cache.values),
+            list(self.cache.events),
+            list(self.cache.event_expiries),
+            list(self.cache.event_receipts),
+            self.cache._next_receipt,
+            self.cache.discard_history(),
+            self.cache.queue_status(),
+        )
+        result = self.cache.release_dedupe('d')
+        self.assertIs(result.released, True)
+        after = (
+            dict(self.cache.values),
+            list(self.cache.events),
+            list(self.cache.event_expiries),
+            list(self.cache.event_receipts),
+            self.cache._next_receipt,
+            self.cache.discard_history(),
+            self.cache.queue_status(),
+        )
+        self.assertEqual(before, after)
+        # 旧事件仍在 FIFO 中、回执仍可取消；释放不写丢弃审计
+        self.assertEqual(self.cache.cancel(receipt),
+                         Result(removed=True, event='e1', reason=None))
+        self.assertEqual(self.cache.discard_history(), [])
+
+    def test_release_keeps_old_event_metadata_unchanged(self):
+        self.cache.push('d', 'e1', 10)  # 到期点 110
+        self.cache.release_dedupe('d')
+        [item] = self.cache.peek_with_metadata()
+        self.assertEqual(item.event, 'e1')
+        self.assertIs(item.dedupe_known, True)
+        self.assertEqual(item.dedupe_key, 'd')
+        self.assertEqual(item.dedupe_expires_at, 110)  # 入队时刻的到期点不变
+
+    def test_release_allows_immediate_repush_and_both_events_coexist(self):
+        self.assertTrue(self.cache.push('d', 'e1', 1000))
+        # 未释放时窗口内被拦截
+        self.assertFalse(self.cache.push('d', 'blocked', 1000))
+        self.cache.release_dedupe('d')
+        repush = self.cache.push_with_reason('d', 'e2', 1000)
+        self.assertTrue(repush.accepted)
+        self.assertIsNone(repush.reason)
+        # 新旧事件按 FIFO 同时存在，去重占用按新 push 重新登记
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2'])
+        self.assertEqual(self.cache.seen['d'], 1100)
+
+    def test_release_does_not_write_discard_history_on_eviction_setup(self):
+        cache = EventCache(self.clock, max_queue=1,
+                           overflow_policy='drop_oldest',
+                           discard_history_limit=10)
+        cache.push('a', 'e1', 1000)
+        cache.push('b', 'e2', 1000)  # 挤出 e1，历史一条 queue_full
+        before = cache.discard_history()
+        self.assertEqual(len(before), 1)
+        cache.release_dedupe('a')
+        cache.release_dedupe('b')
+        cache.release_dedupe('missing')
+        self.assertEqual(cache.discard_history(), before)
+
+    def test_release_after_pop_still_frees_dedupe(self):
+        # pop 只释放队列槽位、保留 seen；释放负责结束窗口
+        self.assertTrue(self.cache.push('d', 'e1', 1000))
+        self.assertEqual(self.cache.pop(), 'e1')
+        self.assertIn('d', self.cache.seen)
+        self.assertFalse(self.cache.push('d', 'e2', 1000))
+        self.assertIs(self.cache.release_dedupe('d').released, True)
+        self.assertTrue(self.cache.push('d', 'e3', 1000))
+
+    # ---- 不可哈希键 ----
+    def test_unhashable_dedupe_raises_type_error_without_clock_or_state(self):
+        self.cache.push('d', 'e1', 10)
+        snapshot_before = self.cache.snapshot()
+        for bad in (['x'], {'y': 1}, {1, 2}):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(TypeError):
+                self.cache.release_dedupe(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)
+        # seen、队列、回执、历史全部不变
+        self.assertEqual(self.cache.snapshot(), snapshot_before)
+
+    # ---- inspect 等只读视图：除 seen 外结果不变 ----
+    def test_release_only_changes_dedupe_view_in_inspect(self):
+        self.cache.put('k', 'v', 1000)
+        self.cache.push('d', 'e1', 1000)
+        before = self.cache.inspect()
+        self.cache.release_dedupe('d')
+        after = self.cache.inspect()
+        self.assertEqual(before.value_count, after.value_count)
+        self.assertEqual(before.expired_value_count, after.expired_value_count)
+        self.assertEqual(before.queue_size, after.queue_size)
+        self.assertEqual(before.live_event_count, after.live_event_count)
+        self.assertEqual(before.expired_event_count, after.expired_event_count)
+        self.assertEqual(before.next_value_expiry, after.next_value_expiry)
+        self.assertEqual(before.next_event_expiry, after.next_event_expiry)
+        self.assertEqual(before.discard_history_size, after.discard_history_size)
+        # 仅去重占用少了一条
+        self.assertEqual(before.dedupe_count - 1, after.dedupe_count)
+        self.assertEqual(self.cache.peek(), ['e1'])
+        self.assertEqual(self.cache.queue_status(), Result(size=1, max_queue=None))
+
+    # ---- apply_batch ----
+    def test_apply_batch_release_then_push_accepted_in_order(self):
+        self.cache.push('d', 'e1', 1000)
+        results = self.cache.apply_batch([
+            ('release_dedupe', 'd'),
+            ('push', 'd', 'e2', 1000),
+        ])
+        self.assertEqual([set(r) for r in results],
+                         [{'released', 'reason'}, {'accepted', 'reason'}])
+        self.assertIs(results[0].released, True)
+        self.assertTrue(results[1].accepted)
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2'])
+
+    def test_apply_batch_double_release_true_then_missing(self):
+        self.cache.push('d', 'e1', 10)
+        results = self.cache.apply_batch([
+            ('release_dedupe', 'd'),
+            ('release_dedupe', 'd'),
+        ])
+        self.assertIs(results[0].released, True)
+        self.assertIs(results[1].released, False)
+        self.assertEqual(results[1].reason, 'missing')
+
+    def test_apply_batch_push_release_push_same_key_in_one_batch(self):
+        # 同刻 push 先登记占用，释放后同键可再次入队，两条事件共存
+        results = self.cache.apply_batch([
+            ('push', 'd', 'e1', 1000),
+            ('release_dedupe', 'd'),
+            ('push', 'd', 'e2', 1000),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertIs(results[1].released, True)
+        self.assertTrue(results[2].accepted)
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2'])
+
+    def test_apply_batch_release_follows_single_batch_clock_convention(self):
+        # 与 delete-only 批次一致：非空批次整批只读一次时钟；释放本身不另读
+        before = self.clock_calls[0]
+        self.cache.apply_batch([('release_dedupe', 'd'),
+                                ('release_dedupe', 'd')])
+        self.assertEqual(self.clock_calls[0] - before, 1)
+
+    def test_apply_batch_release_does_not_touch_queue(self):
+        self.cache.push_with_receipt('d', 'e1', 1000)
+        results = self.cache.apply_batch([('release_dedupe', 'd')])
+        self.assertIs(results[0].released, True)
+        self.assertEqual(self.cache.peek_with_receipt(),
+                         [Result(event='e1', receipt=1)])
+        self.assertEqual(self.cache._next_receipt, 2)
+
+    def test_apply_batch_invalid_release_rejects_whole_batch_before_clock(self):
+        self.cache.put('k', 'v', 100)
+        self.cache.push_with_receipt('d0', 'e0', 100)
+        before = self.cache.snapshot()
+        for bad, exc in (
+            ([('release_dedupe',)], ValueError),                    # 缺键
+            ([('release_dedupe', 'd', 'x')], ValueError),           # 多余元素
+            ([('release_dedupe', ['x'])], TypeError),               # 不可哈希
+            ([('release_dedupe', 'd0'), ('push', 'd', 'e', -1)], ValueError),
+            ([('put', 'a', 1, 10), ('release_dedupe', ['x'])], TypeError),
+        ):
+            calls_before = self.clock_calls[0]
+            with self.assertRaises(exc):
+                self.cache.apply_batch(bad)
+            self.assertEqual(self.clock_calls[0], calls_before)  # 预校验在前
+        # 缓存、回执、历史与时钟水位全部保持整批执行前原样
+        self.assertEqual(self.cache.snapshot(), before)
+        self.assertEqual(self.cache.clock_status().last_time, None)
+
+    # ---- replay_batch ----
+    def test_replay_release_never_reads_injected_clock(self):
+        results = self.cache.replay_batch([
+            (0, ('push', 'd', 'e1', 100)),
+            (50, ('release_dedupe', 'd')),
+            (50, ('release_dedupe', 'd')),
+        ])
+        self.assertEqual(self.clock_calls[0], 0)
+        self.assertIs(results[1].released, True)
+        self.assertIs(results[2].released, False)
+        self.assertEqual(results[2].reason, 'missing')
+
+    def test_replay_release_then_push_in_later_record(self):
+        results = self.cache.replay_batch([
+            (0, ('push', 'd', 'e1', 100)),    # 占用至 100
+            (20, ('release_dedupe', 'd')),
+            (30, ('push', 'd', 'e2', 100)),   # 已释放：接受
+        ])
+        self.assertIs(results[1].released, True)
+        self.assertTrue(results[2].accepted)
+        self.assertEqual(self.cache.pop_batch(), ['e1', 'e2'])
+        self.assertEqual(self.cache.seen['d'], 130)
+
+    def test_replay_release_reports_released_even_past_record_time(self):
+        # 回放不随记录时间推进触发清理：t=100 时记录（到期点 10）仍在
+        results = self.cache.replay_batch([
+            (0, ('push', 'd', 'e1', 10)),
+            (100, ('release_dedupe', 'd')),
+            (101, ('release_dedupe', 'd')),
+        ])
+        self.assertIs(results[1].released, True)
+        self.assertEqual(results[2].reason, 'missing')
+
+    def test_replay_invalid_release_record_rejects_whole_batch(self):
+        self.cache.push('d0', 'e0', 100)
+        before = self.cache.snapshot()
+        for records, exc in (
+            ([(0, ('release_dedupe',))], ValueError),
+            ([(0, ('release_dedupe', 'd', 1))], ValueError),
+            ([(0, ('release_dedupe', ['x']))], TypeError),
+            ([(10, ('release_dedupe', 'd')), (5, ('push', 'd', 'e', 1))],
+             ValueError),  # 时间戳倒退
+        ):
+            with self.assertRaises(exc):
+                self.cache.replay_batch(records)
+        self.assertEqual(self.cache.snapshot(), before)
+
+    # ---- 快照与恢复 ----
+    def test_snapshot_seen_reflects_release_and_roundtrip(self):
+        self.cache.push('d', 'e1', 1000)
+        self.cache.push('g', 'e2', 1000)
+        self.cache.release_dedupe('d')
+        snap = self.cache.snapshot()
+        self.assertNotIn('d', snap.seen)
+        self.assertIn('g', snap.seen)
+
+        restored = EventCache(self.clock)
+        restored.restore(snap)
+        # 恢复后的 seen 准确反映释放结果：d 无占用可立即 push，g 仍在窗口内
+        self.assertEqual(restored.release_dedupe('d').reason, 'missing')
+        self.assertIs(restored.release_dedupe('g').released, True)
+
+    def test_old_snapshot_without_new_fields_still_restores(self):
+        # 不增加任何必填字段：旧四字段快照恢复后释放照常工作
+        old_snapshot = {
+            'values': {},
+            'events': ['old-event'],
+            'seen': {'d': 123},
+            'max_queue': None,
+        }
+        cache = EventCache(self.clock)
+        self.assertIsNone(cache.restore(old_snapshot))
+        self.assertIs(cache.release_dedupe('d').released, True)
+        self.assertEqual(cache.release_dedupe('d').reason, 'missing')
+        # 旧事件（未知键）不被释放触碰
+        self.assertEqual(cache.pop(), 'old-event')
+
+
 if __name__ == '__main__':
     unittest.main()
