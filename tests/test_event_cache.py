@@ -4147,6 +4147,88 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(self.cache.pop_with_receipt(),
                          Result(found=True, event='e', receipt=1))
 
+    def test_restore_rejects_duplicate_receipts(self):
+        base = {'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': None}
+        for receipts in ([2, 2], [1, 1], [3, 3]):
+            cache = self.make()
+            with self.assertRaises(ValueError):
+                cache.restore(dict(
+                    base, event_receipts=receipts, next_receipt=4))
+
+    def test_restore_rejects_out_of_order_receipts(self):
+        base = {'values': {}, 'events': ['a', 'b'], 'seen': {}, 'max_queue': None}
+        for receipts in ([2, 1], [5, 3], [1, 3, 2]):
+            events = ['e%d' % i for i in range(len(receipts))]
+            cache = self.make()
+            with self.assertRaises(ValueError):
+                cache.restore(dict(
+                    base, events=events, event_receipts=receipts,
+                    next_receipt=max(receipts) + 1))
+
+    def test_restore_accepts_gaps_and_none_placeholders(self):
+        # 历史取消/出队造成的编号间隔与 None 占位合法，过滤 None 后仍严格递增
+        cache = self.make()
+        cache.restore({
+            'values': {}, 'events': ['a', 'b', 'c', 'd'], 'seen': {},
+            'max_queue': None,
+            'event_receipts': [None, 2, None, 5], 'next_receipt': 7,
+        })
+        self.assertEqual(cache.peek_with_receipt(), [
+            Result(event='a', receipt=None), Result(event='b', receipt=2),
+            Result(event='c', receipt=None), Result(event='d', receipt=5),
+        ])
+        # 再快照保持回执顺序、编号间隔、None 占位与计数器
+        snap = cache.snapshot()
+        self.assertEqual(snap.event_receipts, [None, 2, None, 5])
+        self.assertEqual(snap.next_receipt, 7)
+        # 继续写入只能从 next_receipt 分配，不复用已发出或已丢弃的编号
+        self.assertEqual(cache.push_with_receipt('d', 'e', 10).receipt, 7)
+        # 取消与出队后编号仍不复用
+        self.assertEqual(cache.cancel(2),
+                         Result(removed=True, event='b', reason=None))
+        self.assertEqual(cache.pop_with_receipt(),
+                         Result(found=True, event='a', receipt=None))
+        self.assertEqual(cache.push_with_receipt('d2', 'f', 10).receipt, 8)
+        # 已取消的回执按 missing 报告
+        self.assertEqual(cache.cancel(2).reason, 'missing')
+
+    def test_restore_receipt_round_trip_preserves_gaps(self):
+        self.cache.push_with_receipt('d1', 'a', 10)   # 1
+        self.cache.push_with_receipt('d2', 'b', 10)   # 2
+        self.cache.push_with_receipt('d3', 'c', 10)   # 3
+        self.cache.cancel(2)                          # 取消造成间隔
+        target = self.make()
+        target.restore(self.cache.snapshot())
+        self.assertEqual([x.receipt for x in target.peek_with_receipt()],
+                         [1, 3])
+        self.assertEqual(target.snapshot().next_receipt, 4)
+        self.assertEqual(target.push_with_receipt('d4', 'd', 10).receipt, 4)
+
+    def test_failed_receipt_restore_does_not_read_clock_or_touch_state(self):
+        self.cache.push_with_receipt('d', 'e', 10)
+        self.cache.put('k', 'v', 50)
+        before = (dict(self.cache.values), list(self.cache.events),
+                  list(self.cache.event_receipts), self.cache._next_receipt,
+                  dict(self.cache.seen), self.cache.max_queue,
+                  self.cache.overflow_policy, self.cache.discard_history(),
+                  self.cache.clock_status())
+        calls_before = self.clock_calls[0]
+        with self.assertRaises(ValueError):
+            self.cache.restore({
+                'values': {}, 'events': ['x', 'y'], 'seen': {},
+                'max_queue': None,
+                'event_receipts': [1, 1], 'next_receipt': 2,
+            })
+        self.assertEqual(self.clock_calls[0], calls_before)  # 未读取注入时钟
+        after = (dict(self.cache.values), list(self.cache.events),
+                 list(self.cache.event_receipts), self.cache._next_receipt,
+                 dict(self.cache.seen), self.cache.max_queue,
+                 self.cache.overflow_policy, self.cache.discard_history(),
+                 self.cache.clock_status())
+        self.assertEqual(before, after)
+        self.assertEqual(self.cache.pop_with_receipt(),
+                         Result(found=True, event='e', receipt=1))
+
     # ---- 各清理/驱逐路径保持回执对齐 ----
     def test_cleanup_and_discard_keep_receipts_aligned(self):
         self.cache.push_expiring('d1', 'x1', 100, 0)  # 回执 1，到期

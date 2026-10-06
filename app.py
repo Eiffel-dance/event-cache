@@ -447,7 +447,9 @@ def _parse_snapshot(snapshot):
     None（无事件 TTL）或有限的绝对到期时刻，overflow_policy 为
     'reject_new' 或 'drop_oldest'（缺省时按 'reject_new' 解释，旧四字段
     与五字段快照因此保持兼容），event_receipts 为与 events 等长的对齐列表，
-    每项为 None（旧事件，无回执）或排除 bool 的正整数回执，next_receipt 为
+    每项为 None（旧事件，无回执）或排除 bool 的正整数回执，且过滤 None 占位
+    后的回执序列必须按队列顺序唯一且严格递增（允许历史取消/出队造成的编号
+    间隔，不允许重复或倒序），next_receipt 为
     排除 bool 的正整数，且必须严格大于 event_receipts 中的任一回执（保证
     恢复后继续递增、不复用；旧快照缺这两个字段时回执按全 None、计数器按
     1 解释，旧事件因此不可被 cancel 命中），discard_history 为按丢弃先后
@@ -469,7 +471,8 @@ def _parse_snapshot(snapshot):
     bool 的有限 int/float，允许负数与已过期时刻，不解释为相对时长。字段
     缺失或多余、非映射/列表容器、二元组结构不符、event_expiries/
     event_receipts/event_metadata 长度不一致、event_metadata 条目结构/
-    known 标记/到期时间非法或键不可哈希、event_receipts/next_receipt 回执非法或
+    known 标记/到期时间非法或键不可哈希、event_receipts/next_receipt 回执非法、
+    非 None 回执重复或未按队列顺序严格递增，或
     next_receipt 不大于在队回执、overflow_policy 非法、历史条目结构/原因/
     时间戳非法、discard_history_limit 非法或任一到期值为
     NaN/无穷/字符串/复合对象、max_queue 非法或 max_queue 为非负整数而事件
@@ -548,8 +551,13 @@ def _parse_snapshot(snapshot):
             if receipt is not None:
                 # 在队回执必须是排除 bool 的正整数
                 _check_receipt(receipt)
-                if receipt > max_receipt:
-                    max_receipt = receipt
+                # 过滤 None 占位后的回执序列必须按队列顺序严格递增：编号
+                # 间隔（历史取消/出队造成）允许，重复与倒序一律拒绝。严格
+                # 递增同时保证唯一性，且 max_receipt 即最后一个非 None 回执
+                if receipt <= max_receipt:
+                    raise ValueError(
+                        'snapshot event_receipts must be unique and strictly increasing')
+                max_receipt = receipt
             event_receipts.append(receipt)
         # next_receipt 与 event_receipts 是一对：给了其一就必须给出另一，
         # 且计数器必须严格大于任一在队回执，保证恢复后继续递增、不复用
@@ -2025,7 +2033,9 @@ class EventCache:
         两个字段成对出现、皆可整体省略：缺省时在队事件全部视为无回执旧事件
         （event_receipts 全 None，peek_with_receipt 中 receipt 为 None，
         cancel 不命中），下一个回执从 1 开始分配；给出时 event_receipts 必须与
-        events 等长对齐、每项为 None 或排除 bool 的正整数，next_receipt 必须
+        events 等长对齐、每项为 None 或排除 bool 的正整数，且过滤 None 占位后
+        的回执序列必须按队列顺序唯一且严格递增（允许历史取消/出队造成的编号
+        间隔与 None 占位，重复或倒序一律拒绝），next_receipt 必须
         是严格大于任一对齐回执的正整数，恢复后在其基础上继续递增、绝不复用。
         event_metadata 字段同样可整体省略：缺省时在队事件全部视为未知键旧
         条目（dedupe_known=False，dedupe_key 与 dedupe_expires_at 为 None，
