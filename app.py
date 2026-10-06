@@ -189,7 +189,8 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
     ('release_dedupe', dedupe)、
-    ('cancel', receipt)、('pop_with_receipt',)、('peek_with_receipt',)、
+    ('cancel', receipt)、('renew_event', receipt, ttl)、
+    ('pop_with_receipt',)、('peek_with_receipt',)、
     ('inspect',)、('cleanup',)、('cleanup_all_expired',) 或
     ('discard_expired_events',)；
     运行期容量调整 ('resize_queue', max_queue) 或
@@ -282,6 +283,15 @@ def _parse_operation(item, allow_event_cleanup=False, allow_reads=False):
         # receipt 非法（含 bool）统一 ValueError，在读时钟或改状态之前抛出
         _check_receipt(receipt)
         return ('cancel', receipt)
+    if tag == 'renew_event':
+        if len(item) != 3:
+            raise ValueError("'renew_event' operation must be ('renew_event', receipt, ttl)")
+        _, receipt, ttl = item
+        # 与 cancel 同一回执校验口径，ttl 与 put/renew 同一时长校验口径；
+        # 任一非法都在读时钟或改状态之前抛出
+        _check_receipt(receipt)
+        _check_duration(ttl, 'ttl')
+        return ('renew_event', receipt, ttl)
     if tag in ('pop_with_receipt', 'peek_with_receipt'):
         # 回执的 pop/peek 属于 receipt 相关操作：apply_batch 与 replay_batch
         # 都接受（不受 allow_reads 限制），且都不带参数
@@ -373,7 +383,7 @@ def _parse_apply_batch(batch):
     ('push_with_receipt', dedupe, event, window)、
     ('push_expiring_with_receipt', dedupe, event, window, event_ttl)、
     ('release_dedupe', dedupe)、
-    ('cancel', receipt)、('inspect',)、('cleanup',)、
+    ('cancel', receipt)、('renew_event', receipt, ttl)、('inspect',)、('cleanup',)、
     ('cleanup_all_expired',)、('discard_expired_events',)、
     ('resize_queue', max_queue[, overflow_policy]) 或
     ('cleanup_expired_events',)。
@@ -396,14 +406,14 @@ def _parse_replay_batch(records):
     只能是非 bool 的有限 int/float，且按非递减顺序出现（同一时间戳共享
     边界，时间倒退抛出 ValueError）；operation 为带标签元组，除
     apply_batch 的 put/renew/delete/push/push_expiring/push_with_receipt/
-    push_expiring_with_receipt/release_dedupe/cancel/inspect/cleanup/
+    push_expiring_with_receipt/release_dedupe/cancel/renew_event/inspect/cleanup/
     cleanup_all_expired/discard_expired_events/resize_queue 与
     ('cleanup_expired_events',) 外，还接受读取与出队路径的记录：('get', key)、
     ('get_with_reason', key)、('pop',)、('pop_with_receipt',)、
     ('pop_batch'[, limit])、('peek'[, limit])、('peek_with_receipt',)、
     ('pop_live_batch'[, limit])、('peek_live_batch'[, limit]) 与
     ('queue_status',)，其中 limit 只能是 None 或非 bool 的非负整数，
-    receipt 只能是排除 bool 的正整数。
+    receipt 只能是排除 bool 的正整数，renew_event 的 ttl 只能是有限非负数值。
     records 不可迭代、记录不是二元结构、时间戳非法或倒退、操作结构/标签/
     参数数量/时长/limit/receipt/max_queue/overflow_policy 非法时统一抛出
     ValueError；key/dedupe 不可哈希时原样抛出 TypeError。返回物化后的
@@ -1321,6 +1331,18 @@ class EventCache:
                     _, receipt = op
                     # 取消不读取时钟、不判 event_ttl：与整批观察时刻无关
                     results.append(self.cancel(receipt))
+                elif tag == 'renew_event':
+                    _, receipt, ttl = op
+                    # 与整批共享唯一一次时钟读数：先查回执（不额外读时钟），
+                    # 命中时按批次观察时刻续期或判到期，结果形状与单项
+                    # renew_event 一致，并按操作顺序影响同批后续操作
+                    index = self._receipt_index(receipt)
+                    if index is None:
+                        results.append(Result(
+                            renewed=False, event=None, reason='missing',
+                            expires_at=None))
+                    else:
+                        results.append(self._renew_event_at(index, ttl, now))
                 elif tag == 'pop_with_receipt':
                     results.append(self.pop_with_receipt())
                 elif tag == 'peek_with_receipt':
@@ -1368,7 +1390,7 @@ class EventCache:
         每项记录为 (timestamp, operation)：timestamp 是非 bool 的有限
         int/float 且按非递减顺序出现；operation 除 apply_batch 的
         put/renew/delete/push/push_expiring/push_with_receipt/
-        push_expiring_with_receipt/release_dedupe/cancel/inspect/cleanup/
+        push_expiring_with_receipt/release_dedupe/cancel/renew_event/inspect/cleanup/
         cleanup_all_expired/discard_expired_events/resize_queue 与
         ('cleanup_expired_events',) 外，还可表达读取与出队路径：
         ('get', key)、('get_with_reason', key)、('pop',)、
@@ -1428,6 +1450,9 @@ class EventCache:
         get_with_reason 为含 found/value/reason 三个字段的 Result，
         push 类回执入口为 receipt/accepted/reason（非默认策略再带 discarded，
         驱逐项含 receipt），cancel 为 removed/event/reason，
+        renew_event 为 renewed/event/reason/expires_at（与单次 renew_event 同
+        形状，新到期点按记录自带时间戳计算，原事件已到期则出队并以该记录时刻
+        写入 event_ttl 丢弃历史，可确定性重放），
         pop_with_receipt 为含 found/event/receipt 三个字段的 Result（空队列
         found=False、event=None、receipt=None），
         pop_batch/peek 为普通 list，peek_with_receipt 为含
@@ -1492,6 +1517,18 @@ class EventCache:
                 _, receipt = op
                 # 取消不读取任何时钟（含记录时刻）：不按 event_ttl 判定
                 results.append(self.cancel(receipt))
+            elif tag == 'renew_event':
+                _, receipt, ttl = op
+                # 以记录自带时刻为观察点续期，不读取注入时钟；回执查找本身
+                # 不读时间，missing/expired/续期成功三种结果与单项 renew_event
+                # 字段一致，丢弃历史的 timestamp 取记录自带时间戳
+                index = self._receipt_index(receipt)
+                if index is None:
+                    results.append(Result(
+                        renewed=False, event=None, reason='missing',
+                        expires_at=None))
+                else:
+                    results.append(self._renew_event_at(index, ttl, now))
             elif tag == 'cleanup':
                 values_removed, dedupe_removed = self._cleanup_at(now)
                 results.append(Result(
@@ -1815,6 +1852,14 @@ class EventCache:
         # 纯查询：不读取时钟、不触发清理、不改变队列
         return Result(size=len(self.events), max_queue=self.max_queue)
 
+    def _receipt_index(self, receipt):
+        # 回执在对齐 deque 中的位置；回执单调且不复用，至多命中一个位置。
+        # 未知、已出队、已驱逐或已取消时返回 None。纯查找，不读时钟、不改状态。
+        for i, queued in enumerate(self.event_receipts):
+            if queued == receipt:
+                return i
+        return None
+
     def cancel(self, receipt):
         """按回执移除仍在队列中的事件，不读取时钟、不判 event_ttl。
 
@@ -1834,17 +1879,12 @@ class EventCache:
         # 回执非法（含 bool、0、负数、浮点数、字符串等）统一 ValueError，
         # 在校验阶段抛出，不读取时钟也不触碰任何状态
         _check_receipt(receipt)
-        index = None
-        for i, queued in enumerate(self.event_receipts):
-            if queued == receipt:
-                index = i
-                break
+        index = self._receipt_index(receipt)
         if index is None:
             # 未知、已出队、已驱逐或已取消：回执永不复用
             return Result(removed=False, event=None, reason='missing')
         # 命中：在同一索引处移除对齐的事件、到期信息、回执与去重元数据。
-        # 回执单调且不复用，因此至多命中一个位置；del deque[i] 保持其余元素
-        # 的相对顺序。
+        # del deque[i] 保持其余元素的相对顺序。
         event = self.events[index]
         del self.events[index]
         del self.event_expiries[index]
@@ -1852,6 +1892,73 @@ class EventCache:
         del self.event_metadata[index]
         # 仅释放容量：seen 去重窗口保留，不写丢弃历史，不推进回执计数
         return Result(removed=True, event=event, reason=None)
+
+    def _renew_event_at(self, index, ttl, now):
+        # 在指定观察时刻按对齐位置续期一个已确认命中的排队事件；ttl 由调用方
+        # 先行校验，本方法自身绝不读取注入时钟。到期边界与全部既有路径一致：
+        # 原到期点 <= now（含恰好相等）即到期——到期事件与 cancel 命中一样在
+        # index 处同步移除 events/event_expiries/event_receipts/event_metadata
+        # 并释放一个容量位置，但按触发时刻 now 写入 reason='event_ttl' 的丢弃
+        # 历史；seen 去重窗口保留，回执不复用。仍存活（含 expiry 为 None 的
+        # 无 TTL 旧事件）的事件只改 event_expiries 该位置的绝对到期点为
+        # now + ttl，队列位置、事件内容、回执编号、去重元数据与容量计数不变。
+        event = self.events[index]
+        expiry = self.event_expiries[index]
+        if expiry is not None and expiry <= now:
+            del self.events[index]
+            del self.event_expiries[index]
+            del self.event_receipts[index]
+            del self.event_metadata[index]
+            self._record_discard(event, 'event_ttl', now)
+            return Result(renewed=False, event=event, reason='expired',
+                          expires_at=None)
+        expires_at = now + ttl
+        self.event_expiries[index] = expires_at
+        return Result(renewed=True, event=event, reason=None,
+                      expires_at=expires_at)
+
+    def renew_event(self, receipt, ttl):
+        """按回执续期仍在队列中的延迟事件，续期只改对应事件的到期点。
+
+        receipt 必须是排除 bool 的正整数，ttl 必须是有限且不小于零的数值
+        （布尔值、负数、NaN、无穷值与其他类型统一抛出 ValueError）；校验失败
+        时不读取时钟、不改变任何状态。回执未知、对应事件已出队
+        （pop/pop_batch/pop_live_batch/pop_with_receipt）、已被驱逐、已被取消，
+        或此前续期判定其到期而出队时，返回
+        Result(renewed=False, event=None, reason='missing', expires_at=None)，
+        且不读取注入时钟。
+
+        命中后只读取一次注入时钟作为观察时刻：原到期点 <= 观察时刻（含恰好
+        相等）的带 TTL 事件已到期，与 cleanup_expired_events 同一 <= 边界和
+        同一移除方式——从队列及 event_expiries/event_receipts/event_metadata
+        对齐移除并立即释放一个容量位置，以观察时刻写入 reason='event_ttl' 的
+        丢弃审计历史，返回 Result(renewed=False, event=原事件,
+        reason='expired', expires_at=None)；其 seen 去重窗口保留到原截止时刻，
+        回执不复用，随后以同一回执再次续期按 missing 返回。仍存活的事件——
+        包括原先未设置 event_ttl（到期点为 None）的事件——把绝对到期点设为
+        观察时刻 + ttl，返回 Result(renewed=True, event=原事件, reason=None,
+        expires_at=新到期点)。ttl 为零照常接受，新到期点即观察时刻，遵循到期
+        点 <= 观察时刻即过期的既有边界（同刻再次续期因此按 expired 处理）。
+
+        续期只写 event_expiries 中该位置的到期点：队列 FIFO 位置、事件内容、
+        event_receipts 回执编号、event_metadata 去重占用、seen 去重窗口、
+        max_queue 容量计数与 overflow_policy 全部不变，不触碰 values；原先无
+        event_ttl 的事件续期后经 snapshot 保存为带对齐 event_expiries 的带 TTL
+        事件，缺少 event_expiries 的旧快照恢复后仍按无 TTL 事件续期。时间只
+        来自注入时钟，不启动后台线程。reject_regression 下时钟回退时抛出
+        ClockRegressionError，抛出前水位与全部状态（含到期点）保持不变；时钟
+        自身抛出的其他异常原样传播且状态不变。
+        """
+        # 与 cancel 同一回执校验、与 renew 同一时长校验：失败时不读时钟、
+        # 不触碰任何状态
+        _check_receipt(receipt)
+        _check_duration(ttl, 'ttl')
+        index = self._receipt_index(receipt)
+        if index is None:
+            # 未知、已出队、已驱逐、已取消或已因到期出队：不读取注入时钟
+            return Result(renewed=False, event=None, reason='missing',
+                          expires_at=None)
+        return self._renew_event_at(index, ttl, self._read_clock())
 
     def _resize_queue_at(self, max_queue, overflow_policy, now):
         # 在指定观察时刻应用新的容量与溢出策略；max_queue/overflow_policy 由
@@ -1926,8 +2033,9 @@ class EventCache:
 
         只记录两类丢弃：事件因 event_ttl 到期被清理
         （cleanup_expired_events、discard_expired_events、
-        cleanup_all_expired、apply_batch/replay_batch 中的对应操作以及
-        pop_live_batch 的过期感知出队），原因固定为 'event_ttl'；
+        cleanup_all_expired、apply_batch/replay_batch 中的对应操作、
+        pop_live_batch 的过期感知出队，以及 renew_event/
+        apply_batch/replay_batch 续期时发现原到期点已过而将事件出队），原因固定为 'event_ttl'；
         drop_oldest 策略下入队从队首挤出事件，或 resize_queue 缩容时按
         FIFO 队首挤出事件，原因固定为 'queue_full'。
         普通 pop/pop_batch 消费、reject_new 下的 queue_full 拒绝与
