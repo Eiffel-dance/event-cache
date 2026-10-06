@@ -5640,5 +5640,307 @@ class RenewEventTest(unittest.TestCase):
         self.assertEqual(cache.snapshot().event_expiries, [110])
 
 
+class AutoCleanupOnPushTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [100]
+        self.clock_calls = [0]
+
+        def clock():
+            self.clock_calls[0] += 1
+            return self.now[0]
+
+        self.clock = clock
+
+    def make(self, auto_cleanup_on_push=True, **kwargs):
+        return EventCache(self.clock,
+                          auto_cleanup_on_push=auto_cleanup_on_push, **kwargs)
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    # ---- 构造参数校验 ----
+    def test_default_is_disabled(self):
+        cache = EventCache(self.clock)
+        self.assertIs(cache.auto_cleanup_on_push, False)
+
+    def test_bool_values_accepted(self):
+        self.assertIs(self.make(True).auto_cleanup_on_push, True)
+        self.assertIs(self.make(False).auto_cleanup_on_push, False)
+
+    def test_invalid_option_raises_value_error(self):
+        for bad in (0, 1, 0.0, 1.0, 'true', '', None, [], [1], object()):
+            with self.assertRaises(ValueError):
+                self.make(bad)
+
+    def test_invalid_option_does_not_read_clock(self):
+        calls = [0]
+
+        def counting_clock():
+            calls[0] += 1
+            return 0
+
+        for bad in (0, 1, 'x', None):
+            with self.assertRaises(ValueError):
+                EventCache(counting_clock, auto_cleanup_on_push=bad)
+        self.assertEqual(calls[0], 0)
+
+    # ---- 写入前惰性清理（容量判定之前） ----
+    def test_push_cleans_expired_before_capacity_check(self):
+        cache = self.make(max_queue=1)
+        cache.push_expiring('d1', 'e1', 1000, 5)   # 到期点 105
+        self.advance(10)  # 110：e1 已到期但仍占槽
+        self.assertTrue(cache.push('d2', 'e2', 1000))
+        # 隐式清理先移除 e1 释放槽位，e2 因此被接受而非报 queue_full
+        self.assertEqual(list(cache.events), ['e2'])
+        history = cache.discard_history()
+        self.assertEqual([(h.event, h.reason, h.timestamp) for h in history],
+                         [('e1', 'event_ttl', 110)])
+
+    def test_cleanup_happens_before_dedupe_check_and_keeps_seen(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 1000, 5)   # seen['d1'] = 1100
+        self.advance(10)  # 110
+        result = cache.push_with_reason('d1', 'e1b', 1000)
+        # 事件被清理，但 seen 去重窗口不受影响：窗口内仍报 dedupe_window
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, 'dedupe_window')
+        self.assertEqual([d.event for d in result.discarded], ['e1'])
+        self.assertEqual(list(cache.events), [])
+        self.assertIn('d1', cache.seen)
+
+    def test_implicit_cleanup_does_not_touch_values(self):
+        cache = self.make()
+        cache.put('k', 'v', 5)                      # 到期点 105
+        cache.push_expiring('d1', 'e1', 1000, 5)   # 到期点 105
+        self.advance(10)  # 110
+        cache.push('d2', 'e2', 1000)
+        # 隐式清理只动事件队列与审计：过期值记录仍惰性留在 values 中
+        self.assertIn('k', cache.values)
+        self.assertEqual(list(cache.events), ['e2'])
+
+    def test_push_reads_clock_exactly_once(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 1000, 5)
+        self.assertEqual(self.clock_calls[0], 1)
+        self.advance(10)
+        cache.push('d2', 'e2', 1000)
+        self.assertEqual(self.clock_calls[0], 2)
+
+    # ---- 结果形状 ----
+    def test_reject_new_reports_discarded_only_when_cleanup_happened(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 1000, 5)
+        self.advance(10)
+        result = cache.push_with_reason('d2', 'e2', 1000)
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [(d.event, d.reason) for d in result.discarded],
+            [('e1', 'event_ttl')])
+        # 无清理时保持原形状：reject_new 下不带 discarded 字段
+        result2 = cache.push_with_reason('d3', 'e3', 1000)
+        self.assertNotIn('discarded', result2)
+
+    def test_receipt_interfaces_keep_receipt_in_discarded(self):
+        cache = self.make()
+        first = cache.push_expiring_with_receipt('d1', 'e1', 1000, 5)
+        self.advance(10)
+        result = cache.push_with_receipt('d2', 'e2', 1000)
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [(d.event, d.reason, d.receipt) for d in result.discarded],
+            [('e1', 'event_ttl', first.receipt)])
+
+    def test_drop_oldest_lists_event_ttl_before_queue_full(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        # 手工构造超容状态（正常路径 len <= max_queue，此处专为验证排序）：
+        # 一个已到期带 TTL 事件 + 一个存活事件
+        cache.events.append('expired')
+        cache.event_expiries.append(50)
+        cache.event_receipts.append(7)
+        cache.event_metadata.append(Result(
+            dedupe_known=True, dedupe_key='dx', dedupe_expires_at=60))
+        cache.events.append('live')
+        cache.event_expiries.append(None)
+        cache.event_receipts.append(8)
+        cache.event_metadata.append(Result(
+            dedupe_known=True, dedupe_key='dy', dedupe_expires_at=None))
+        result = cache.push_with_reason('d3', 'e3', 1000)
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [(d.event, d.reason) for d in result.discarded],
+            [('expired', 'event_ttl'), ('live', 'queue_full')])
+        self.assertEqual(
+            [(h.event, h.reason, h.timestamp) for h in cache.discard_history()],
+            [('expired', 'event_ttl', 100), ('live', 'queue_full', 100)])
+
+    def test_drop_oldest_receipt_result_orders_and_keeps_receipts(self):
+        cache = self.make(max_queue=1, overflow_policy='drop_oldest')
+        cache.events.append('expired')
+        cache.event_expiries.append(50)
+        cache.event_receipts.append(7)
+        cache.event_metadata.append(Result(
+            dedupe_known=True, dedupe_key='dx', dedupe_expires_at=60))
+        cache.events.append('live')
+        cache.event_expiries.append(None)
+        cache.event_receipts.append(8)
+        cache.event_metadata.append(Result(
+            dedupe_known=True, dedupe_key='dy', dedupe_expires_at=None))
+        result = cache.push_with_receipt('d3', 'e3', 1000)
+        self.assertEqual(
+            [(d.event, d.reason, d.receipt) for d in result.discarded],
+            [('expired', 'event_ttl', 7), ('live', 'queue_full', 8)])
+
+    def test_push_expiring_with_reason_reports_discarded(self):
+        cache = self.make()
+        cache.push_expiring('d1', 'e1', 1000, 5)
+        self.advance(10)
+        result = cache.push_expiring_with_reason('d2', 'e2', 1000, 50)
+        self.assertTrue(result.accepted)
+        self.assertEqual([d.event for d in result.discarded], ['e1'])
+
+    # ---- 批量写入 ----
+    def test_push_batch_cleans_zero_ttl_event_before_next_write(self):
+        cache = self.make()
+        results = cache.push_batch([
+            ('d1', 'e1', 1000, 0),   # 接受时刻即到期（到期点 == 批次时刻）
+            ('d2', 'e2', 1000),      # 下一写入前先清掉 e1
+        ])
+        self.assertTrue(all(r.accepted for r in results))
+        self.assertNotIn('discarded', results[0])
+        self.assertEqual(
+            [(d.event, d.reason) for d in results[1].discarded],
+            [('e1', 'event_ttl')])
+        self.assertEqual(list(cache.events), ['e2'])
+        # 整批仍只读一次注入时钟
+        self.assertEqual(self.clock_calls[0], 1)
+
+    def test_apply_batch_cleans_per_write_in_order(self):
+        cache = self.make()
+        results = cache.apply_batch([
+            ('push_expiring', 'd1', 'e1', 1000, 0),
+            ('push_with_receipt', 'd2', 'e2', 1000),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertTrue(results[1].accepted)
+        # e1 在内部接受时分配回执 1，隐式清理的 discarded 携带该回执
+        self.assertEqual(
+            [(d.event, d.reason, d.receipt) for d in results[1].discarded],
+            [('e1', 'event_ttl', 1)])
+        self.assertEqual(list(cache.events), ['e2'])
+        self.assertEqual(self.clock_calls[0], 1)
+
+    def test_push_batch_disabled_option_keeps_shape(self):
+        cache = self.make(False)
+        results = cache.push_batch([
+            ('d1', 'e1', 1000, 0),
+            ('d2', 'e2', 1000),
+        ])
+        for result in results:
+            self.assertNotIn('discarded', result)
+        # 关闭选项时不做隐式清理：到期事件仍占槽
+        self.assertEqual(list(cache.events), ['e1', 'e2'])
+        self.assertEqual(cache.discard_history(), [])
+
+    # ---- 回放 ----
+    def test_replay_batch_uses_record_timestamps_and_never_reads_clock(self):
+        def exploding_clock():
+            raise AssertionError('replay_batch must not read the injected clock')
+
+        cache = EventCache(exploding_clock, auto_cleanup_on_push=True)
+        results = cache.replay_batch([
+            (100, ('push_expiring', 'd1', 'e1', 1000, 5)),
+            (110, ('push', 'd2', 'e2', 1000)),
+            (110, ('push_with_receipt', 'd3', 'e3', 1000)),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertNotIn('discarded', results[0])
+        # 第二条记录以自带时刻 110 清理 e1（到期点 105 <= 110）
+        self.assertEqual(
+            [(d.event, d.reason) for d in results[1].discarded],
+            [('e1', 'event_ttl')])
+        self.assertNotIn('discarded', results[2])
+        self.assertEqual(list(cache.events), ['e2', 'e3'])
+        self.assertEqual(
+            [(h.event, h.reason, h.timestamp) for h in cache.discard_history()],
+            [('e1', 'event_ttl', 110)])
+
+    def test_replay_batch_cleans_zero_ttl_event_at_same_timestamp(self):
+        def exploding_clock():
+            raise AssertionError('replay_batch must not read the injected clock')
+
+        cache = EventCache(exploding_clock, auto_cleanup_on_push=True)
+        results = cache.replay_batch([
+            (100, ('push_expiring_with_receipt', 'd1', 'e1', 1000, 0)),
+            (100, ('push_expiring_with_receipt', 'd2', 'e2', 1000, 50)),
+        ])
+        self.assertTrue(results[0].accepted)
+        self.assertEqual(
+            [(d.event, d.reason, d.receipt) for d in results[1].discarded],
+            [('e1', 'event_ttl', results[0].receipt)])
+        self.assertEqual(list(cache.events), ['e2'])
+
+    # ---- 快照与恢复 ----
+    def test_snapshot_saves_option_only_when_enabled(self):
+        enabled = self.make(True)
+        disabled = self.make(False)
+        self.assertIs(enabled.snapshot()['auto_cleanup_on_push'], True)
+        self.assertNotIn('auto_cleanup_on_push', disabled.snapshot())
+
+    def test_snapshot_restore_round_trip_preserves_mode_and_state(self):
+        cache = self.make(True, max_queue=10, discard_history_limit=5)
+        cache.push_expiring_with_receipt('d1', 'e1', 1000, 5)
+        cache.push_with_receipt('d2', 'e2', 1000)
+        self.advance(10)
+        cache.push('d3', 'e3', 1000)  # 隐式清理 e1，写入一条审计历史
+        snap = cache.snapshot()
+
+        target = self.make(False)
+        target.restore(snap)
+        self.assertIs(target.auto_cleanup_on_push, True)
+        self.assertEqual(list(target.events), ['e2', 'e3'])
+        self.assertEqual(list(target.event_expiries), [None, None])
+        self.assertEqual(target.seen, cache.seen)
+        self.assertEqual(list(target.event_receipts),
+                         list(cache.event_receipts))
+        self.assertEqual(
+            [(h.event, h.reason, h.timestamp) for h in target.discard_history()],
+            [('e1', 'event_ttl', 110)])
+        # 恢复后隐式清理继续生效
+        target.push_expiring('d4', 'e4', 1000, 0)
+        self.advance(0)
+        result = target.push_with_reason('d5', 'e5', 1000)
+        self.assertEqual([d.event for d in result.discarded], ['e4'])
+
+    def test_restore_missing_option_defaults_to_false(self):
+        cache = self.make(True)
+        cache.restore({'values': {}, 'events': [], 'seen': {}, 'max_queue': None})
+        self.assertIs(cache.auto_cleanup_on_push, False)
+
+    def test_restore_invalid_option_raises_and_preserves_state(self):
+        cache = self.make(True)
+        cache.push('d1', 'e1', 1000)
+        before = cache.snapshot()
+        for bad in (0, 1, 'true', None, []):
+            snap = dict(before)
+            snap['auto_cleanup_on_push'] = bad
+            with self.assertRaises(ValueError):
+                cache.restore(snap)
+        # 非法快照在替换状态前抛出：模式与数据完全保持
+        self.assertIs(cache.auto_cleanup_on_push, True)
+        self.assertEqual(list(cache.events), ['e1'])
+
+    # ---- 关闭选项时行为不变 ----
+    def test_disabled_option_preserves_existing_semantics(self):
+        cache = self.make(False, max_queue=1)
+        cache.push_expiring('d1', 'e1', 1000, 5)
+        self.advance(10)  # e1 已到期但仍占槽
+        result = cache.push_with_reason('d2', 'e2', 1000)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, 'queue_full')
+        self.assertNotIn('discarded', result)
+        self.assertEqual(list(cache.events), ['e1'])
+        self.assertEqual(cache.discard_history(), [])
+
+
 if __name__ == '__main__':
     unittest.main()
